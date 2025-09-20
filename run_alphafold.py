@@ -702,6 +702,10 @@ def process_fold_input(
   else:
     print(f'Output will be written in {output_dir}')
 
+  # HH: add output_dir to fold_input for saving the cached MSA
+  os.makedirs(output_dir, exist_ok=True)
+  object.__setattr__(fold_input, 'output_dir', output_dir)
+
   if data_pipeline_config is None:
     print('Skipping data pipeline...')
   else:

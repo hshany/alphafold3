@@ -869,6 +869,8 @@ class Input:
   rng_seeds: Sequence[int]
   bonded_atom_pairs: Sequence[tuple[BondAtomId, BondAtomId]] | None = None
   user_ccd: str | None = None
+  # HH
+  output_dir: str
 
   def __post_init__(self):
     if not self.rng_seeds:
@@ -1160,6 +1162,8 @@ class Input:
         rng_seeds=[int(seed) for seed in raw_json['modelSeeds']],
         bonded_atom_pairs=bonded_atom_pairs,
         user_ccd=user_ccd,
+        # HH
+        output_dir=''
     )
 
   @classmethod

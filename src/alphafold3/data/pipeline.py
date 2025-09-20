@@ -410,8 +410,10 @@ class DataPipeline:
     )
     self._pdb_database_path = data_pipeline_config.pdb_database_path
 
+  # HH: add output_dir to the argument list to save cached MSA
   def process_protein_chain(
-      self, chain: folding_input.ProteinChain
+      self, chain: folding_input.ProteinChain,
+      output_dir: str
   ) -> folding_input.ProteinChain:
     """Processes a single protein chain."""
     has_unpaired_msa = chain.unpaired_msa is not None
@@ -432,6 +434,14 @@ class DataPipeline:
       )
       unpaired_msa = unpaired_msa.to_a3m()
       paired_msa = paired_msa.to_a3m()
+      # HH: save cached MSA to output_dir
+      logging.info(
+          'Saving MSA to .a3m files for later use' 
+      )
+      with open(f'{output_dir}/{chain.id}.unpaired.a3m', 'w') as f:
+          f.write(unpaired_msa)
+      with open(f'{output_dir}/{chain.id}.paired.a3m', 'w') as f:
+          f.write(paired_msa)
       templates = [
           folding_input.Template(
               mmcif=struc.to_mmcif(),
@@ -537,7 +547,8 @@ class DataPipeline:
       process_chain_start_time = time.time()
       match chain:
         case folding_input.ProteinChain():
-          processed_chains.append(self.process_protein_chain(chain))
+          # HH: pass output_dir to process_protein_chain() to save the cached MSA
+          processed_chains.append(self.process_protein_chain(chain, fold_input.output_dir))
         case folding_input.RnaChain():
           processed_chains.append(self.process_rna_chain(chain))
         case _:
