@@ -47,7 +47,6 @@ python peptide_variant_screen.py \
     --peptide_sequences example_inputs/peptides.fasta \
     --output_dir results/ \
     --model_dir /path/to/alphafold3/model \
-    --rng_seed 42 \
     --num_diffusion_samples 1 \
     --num_recycles 3
 ```
@@ -108,7 +107,6 @@ GGGLLLLLLK
 - `--peptide_sequences`: Path to FASTA file with peptide sequences (required)
 - `--output_dir`: Output directory for results (required)
 - `--model_dir`: Path to AlphaFold3 model directory (required)
-- `--rng_seed`: Random number generator seed (default: 42)
 - `--num_diffusion_samples`: Number of diffusion samples to generate (default: 1)
 - `--num_recycles`: Number of recycles during inference (default: 3)
 
@@ -174,6 +172,11 @@ The script provides comprehensive logging at different levels:
 - **ERROR**: Critical failures and troubleshooting guidance
 
 Log files are saved to `peptide_screening.log`.
+
+Note on RNG seeds: This script uses the first seed from the input JSON for both
+setup (compilation) and inference across all peptide variants. This ensures
+results are directly comparable across variants. To change the seed, update the
+`modelSeeds` in your input JSON.
 
 ## Troubleshooting
 

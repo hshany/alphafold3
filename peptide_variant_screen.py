@@ -39,6 +39,9 @@ from alphafold3.constants import mmcif_names
 from alphafold3.data import featurisation
 from alphafold3.model import model
 from alphafold3.model import features
+from alphafold3.data import msa as msa_module
+from alphafold3.model import data3
+from alphafold3.model import data_constants
 
 # Configure logging
 logging.basicConfig(
@@ -198,7 +201,8 @@ def update_batch_for_new_peptide(
     base_batch: features.BatchDict, 
     new_sequence: str,
     peptide_positions: np.ndarray,
-    chain_id: str
+    chain_id: str,
+    peptide_row_indices: Optional[np.ndarray] = None
 ) -> features.BatchDict:
     """Update batch features for a new peptide sequence."""
     logger.debug(f"Updating batch for peptide chain {chain_id} with sequence: {new_sequence}")
@@ -219,6 +223,47 @@ def update_batch_for_new_peptide(
         logger.debug(f"Updated positions {peptide_positions} with new sequence: {new_sequence}")
         logger.debug(f"New aatype values: {[current_aatype[pos] for pos in peptide_positions[:len(new_aatype)]]}")
     
+    # Update MSA features for peptide chain, if possible
+    try:
+        if peptide_row_indices is None:
+            peptide_row_indices = np.array([], dtype=np.int32)
+        if len(peptide_positions) > 0 and len(peptide_row_indices) > 0:
+            # Build query-only A3M to encode new sequence consistently
+            a3m = f">query\n{new_sequence}\n"
+            pep_msa = msa_module.Msa.from_a3m(
+                query_sequence=new_sequence,
+                chain_poly_type=mmcif_names.PROTEIN_CHAIN,
+                a3m=a3m,
+                deduplicate=False,
+            )
+            pep_feats = pep_msa.featurize()
+            pep_msa_row = pep_feats['msa'][0]
+            pep_del_row = pep_feats['deletion_matrix'][0]
+
+            if len(pep_msa_row) != len(peptide_positions):
+                logger.error(
+                    "Peptide MSA row length (%d) does not match peptide token positions (%d)",
+                    len(pep_msa_row), len(peptide_positions)
+                )
+
+            new_msa_block = np.tile(pep_msa_row, (len(peptide_row_indices), 1))
+            new_del_block = np.tile(pep_del_row, (len(peptide_row_indices), 1))
+
+            updated_batch['msa'][np.ix_(peptide_row_indices, peptide_positions)] = new_msa_block.astype(np.int8)
+            updated_batch['deletion_matrix'][np.ix_(peptide_row_indices, peptide_positions)] = new_del_block.astype(np.int8)
+
+            prof = data3.get_profile_features(new_msa_block, new_del_block)
+            updated_batch['profile'][peptide_positions, :] = prof['profile'].astype(np.float32)
+            updated_batch['deletion_mean'][peptide_positions] = prof['deletion_mean'].astype(np.float32)
+
+            logger.debug(
+                f"Updated peptide MSA rows {peptide_row_indices.tolist()} and columns {peptide_positions.tolist()}"
+            )
+        else:
+            logger.debug("Skipping MSA update: no peptide positions or peptide MSA rows detected.")
+    except Exception as e:
+        logger.warning(f"Failed to update MSA features for peptide chain {chain_id}: {e}")
+
     logger.debug(f"Updated aatype for {len(peptide_positions)} positions")
     return updated_batch
 
@@ -243,6 +288,7 @@ class OptimizedPeptideRunner:
         self.model_runner = None
         self.base_batch = None
         self.peptide_positions = None
+        self.peptide_row_indices = None
         self.is_compiled = False
         
         logger.info(f"Initialized OptimizedPeptideRunner on device: {self.device}")
@@ -304,11 +350,29 @@ class OptimizedPeptideRunner:
             self.peptide_positions = find_chain_token_positions(self.base_batch, peptide_chain_id)
             logger.info(f"Using batch analysis: found {len(self.peptide_positions)} peptide positions")
         
+        # Cache peptide MSA row indices where peptide columns are non-gap
+        try:
+            gap_idx = data_constants.MSA_GAP_IDX
+            msa_arr = self.base_batch['msa']  # (msa_rows, num_tokens)
+            pep_cols = self.peptide_positions
+            if pep_cols is None or len(pep_cols) == 0:
+                self.peptide_row_indices = np.array([], dtype=np.int32)
+                logger.warning("No peptide positions found; cannot cache peptide MSA rows.")
+            else:
+                peptide_row_mask = (msa_arr[:, pep_cols] != gap_idx).any(axis=1)
+                self.peptide_row_indices = np.where(peptide_row_mask)[0].astype(np.int32)
+                logger.info(f"Cached {len(self.peptide_row_indices)} peptide MSA row(s)")
+        except Exception as e:
+            logger.warning(f"Failed to cache peptide MSA row indices: {e}")
+            self.peptide_row_indices = np.array([], dtype=np.int32)
+        
         # Compile the model by running inference once
         logger.info("Compiling JAX model (this will take ~80 seconds)...")
         compile_start = time.time()
         
-        rng_key = jax.random.PRNGKey(fold_input.rng_seeds[0])
+        # Cache the seed used for setup and inference for comparability
+        self.setup_seed = fold_input.rng_seeds[0]
+        rng_key = jax.random.PRNGKey(self.setup_seed)
         _ = self.model_runner.run_inference(self.base_batch, rng_key)
         
         compile_time = time.time() - compile_start
@@ -319,10 +383,9 @@ class OptimizedPeptideRunner:
         logger.info(f"Total setup completed in {setup_time:.2f} seconds")
     
     def run_peptide_variant(
-        self, 
+        self,
         peptide_sequence: str,
         peptide_chain_id: str,
-        rng_seed: int
     ) -> Dict:
         """Run inference for a peptide variant."""
         if not self.is_compiled:
@@ -337,13 +400,15 @@ class OptimizedPeptideRunner:
             self.base_batch,
             peptide_sequence, 
             self.peptide_positions,
-            peptide_chain_id
+            peptide_chain_id,
+            self.peptide_row_indices,
         )
         update_time = time.time() - update_start
         
         # Run inference with compiled model
         inference_start = time.time()
-        rng_key = jax.random.PRNGKey(rng_seed)
+        # Use the same seed as setup (first seed from input JSON) for comparability
+        rng_key = jax.random.PRNGKey(self.setup_seed)
         result = self.model_runner.run_inference(updated_batch, rng_key)
         inference_time = time.time() - inference_start
         
@@ -397,8 +462,6 @@ def main():
                        help='Output directory for results')
     parser.add_argument('--model_dir', type=pathlib.Path, required=True,
                        help='Path to AlphaFold3 model directory')
-    parser.add_argument('--rng_seed', type=int, default=42,
-                       help='Random number generator seed')
     parser.add_argument('--num_diffusion_samples', type=int, default=1,
                        help='Number of diffusion samples to generate (default: 1)')
     parser.add_argument('--num_recycles', type=int, default=3,
@@ -415,7 +478,6 @@ def main():
     logger.info(f"Sequences: {args.peptide_sequences}")
     logger.info(f"Output: {args.output_dir}")
     logger.info(f"Model config: num_diffusion_samples={args.num_diffusion_samples}, num_recycles={args.num_recycles}")
-    logger.info(f"Random seed: {args.rng_seed}")
     
     # Load input data
     fold_input = load_fold_input(args.json_path)
@@ -442,9 +504,8 @@ def main():
         
         try:
             result = runner.run_peptide_variant(
-                sequence, 
+                sequence,
                 args.peptide_chain_id,
-                args.rng_seed + i  # Different seed per variant
             )
             result['name'] = name
             results.append(result)
