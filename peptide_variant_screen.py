@@ -12,7 +12,9 @@ Usage:
         --peptide_chain_id C \
         --peptide_sequences peptides.fasta \
         --output_dir results/ \
-        --model_dir path/to/model
+        --model_dir path/to/model \
+        --num_diffusion_samples 1 \
+        --num_recycles 3
 """
 
 import argparse
@@ -22,6 +24,7 @@ import logging
 import pathlib
 import time
 import sys
+import traceback
 from typing import Dict, List, Optional, Sequence
 
 import jax
@@ -132,21 +135,20 @@ def find_chain_token_positions(batch: features.BatchDict, chain_id: str) -> np.n
             logger.warning(f"Using heuristic chain detection for chain {chain_id}")
             logger.warning("This may not be accurate - implement proper chain tracking")
             
-            # For demonstration: assume chain C is the last chain
-            # You would need to implement proper logic based on your specific structure
-            if chain_id == 'C':
-                # This is a placeholder - you'd need to know the actual chain boundaries
-                # from your input structure
-                mask = token_features.get('mask', None)
-                if mask is not None:
-                    # Assume last 10 positions are chain C (peptide)
-                    # This is just an example - use actual chain boundaries
-                    total_tokens = np.sum(mask)
+            # Try to use seq_mask or other available info
+            if 'seq_mask' in batch:
+                seq_mask = batch['seq_mask']
+                total_tokens = np.sum(seq_mask)
+                logger.debug(f"Total tokens from seq_mask: {total_tokens}")
+                
+                # For chain C (typically the last/peptide chain), use heuristic
+                if chain_id == 'C':
+                    # Assume peptide is the last 10 positions
                     chain_positions = list(range(max(0, total_tokens - 10), total_tokens))
                     
                     if chain_positions:
                         positions = np.array(chain_positions, dtype=np.int32)
-                        logger.warning(f"Using heuristic: assigned {len(positions)} tokens to chain {chain_id}")
+                        logger.warning(f"Using heuristic: assigned positions {positions} to chain {chain_id}")
                         return positions
     except (AttributeError, KeyError) as e:
         logger.debug(f"Method 2 failed: {e}")
@@ -204,15 +206,18 @@ def update_batch_for_new_peptide(
     # Create a copy of the base batch
     updated_batch = copy.deepcopy(base_batch)
     
-    # Update aatype in token_features
+    # Update aatype directly (it's a top-level key in the batch)
     new_aatype = sequence_to_aatype(new_sequence)
     
     if len(peptide_positions) > 0:
         # Update the aatype array at peptide positions
-        current_aatype = updated_batch['token_features']['aatype']
+        current_aatype = updated_batch['aatype']
         for i, pos in enumerate(peptide_positions):
-            if i < len(new_aatype):
+            if i < len(new_aatype) and pos < len(current_aatype):
                 current_aatype[pos] = new_aatype[i]
+        
+        logger.debug(f"Updated positions {peptide_positions} with new sequence: {new_sequence}")
+        logger.debug(f"New aatype values: {[current_aatype[pos] for pos in peptide_positions[:len(new_aatype)]]}")
     
     logger.debug(f"Updated aatype for {len(peptide_positions)} positions")
     return updated_batch
@@ -221,10 +226,18 @@ def update_batch_for_new_peptide(
 class OptimizedPeptideRunner:
     """Optimized runner for peptide variant screening."""
     
-    def __init__(self, model_dir: pathlib.Path, device: Optional[jax.Device] = None):
+    def __init__(
+        self, 
+        model_dir: pathlib.Path, 
+        device: Optional[jax.Device] = None,
+        num_diffusion_samples: int = 1,
+        num_recycles: int = 3
+    ):
         """Initialize the optimized runner."""
         self.model_dir = model_dir
         self.device = device or jax.devices()[0]
+        self.num_diffusion_samples = num_diffusion_samples
+        self.num_recycles = num_recycles
         
         # Cached components
         self.model_runner = None
@@ -233,6 +246,7 @@ class OptimizedPeptideRunner:
         self.is_compiled = False
         
         logger.info(f"Initialized OptimizedPeptideRunner on device: {self.device}")
+        logger.info(f"Model config: num_diffusion_samples={num_diffusion_samples}, num_recycles={num_recycles}")
     
     def setup_base_system(
         self, 
@@ -264,9 +278,14 @@ class OptimizedPeptideRunner:
         feat_time = time.time() - feat_start
         logger.info(f"Featurization completed in {feat_time:.2f} seconds")
         
-        # Initialize model runner
+        # Initialize model runner with custom config
         logger.info("Initializing model runner...")
-        config = model.Model.Config()
+        config = make_model_config(
+            num_diffusion_samples=self.num_diffusion_samples,
+            num_recycles=self.num_recycles,
+            return_embeddings=False,
+            return_distogram=False
+        )
         self.model_runner = AF3ModelRunner(config, self.device, self.model_dir)
         
         # Create chain mapping from fold_input for better chain tracking
@@ -362,7 +381,7 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from run_alphafold import ModelRunner as AF3ModelRunner
+from run_alphafold import ModelRunner as AF3ModelRunner, make_model_config
 
 
 def main():
@@ -380,6 +399,10 @@ def main():
                        help='Path to AlphaFold3 model directory')
     parser.add_argument('--rng_seed', type=int, default=42,
                        help='Random number generator seed')
+    parser.add_argument('--num_diffusion_samples', type=int, default=1,
+                       help='Number of diffusion samples to generate (default: 1)')
+    parser.add_argument('--num_recycles', type=int, default=3,
+                       help='Number of recycles to use during inference (default: 3)')
     
     args = parser.parse_args()
     
@@ -391,13 +414,19 @@ def main():
     logger.info(f"Peptide chain: {args.peptide_chain_id}")
     logger.info(f"Sequences: {args.peptide_sequences}")
     logger.info(f"Output: {args.output_dir}")
+    logger.info(f"Model config: num_diffusion_samples={args.num_diffusion_samples}, num_recycles={args.num_recycles}")
+    logger.info(f"Random seed: {args.rng_seed}")
     
     # Load input data
     fold_input = load_fold_input(args.json_path)
     peptide_sequences = load_peptide_sequences(args.peptide_sequences)
     
     # Initialize optimized runner
-    runner = OptimizedPeptideRunner(args.model_dir)
+    runner = OptimizedPeptideRunner(
+        args.model_dir,
+        num_diffusion_samples=args.num_diffusion_samples,
+        num_recycles=args.num_recycles
+    )
     
     # Setup base system (expensive, done once)
     runner.setup_base_system(fold_input, args.peptide_chain_id)
@@ -427,6 +456,8 @@ def main():
                 
         except Exception as e:
             logger.error(f"Failed to process variant {name}: {e}")
+            traceback.print_exc()
+            raise
             continue
     
     total_time = time.time() - total_start

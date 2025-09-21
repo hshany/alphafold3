@@ -7,6 +7,7 @@ This implementation provides an efficient workflow for screening multiple peptid
 - **JAX Compilation Reuse**: ~79 seconds compilation overhead occurs only once
 - **Feature Caching**: Protein complex features computed once and reused
 - **Selective Updates**: Only peptide-specific features are updated per variant
+- **Configurable Model Parameters**: Customizable diffusion samples and recycles for speed/accuracy tradeoff
 - **Comprehensive Logging**: Detailed timing and debugging information
 - **Error Handling**: Robust error handling and fallback mechanisms
 
@@ -41,12 +42,14 @@ This creates:
 
 ```bash
 python peptide_variant_screen.py \
-    --fold_input_json example_inputs/complex.json \
+    --json_path example_inputs/complex.json \
     --peptide_chain_id C \
     --peptide_sequences example_inputs/peptides.fasta \
     --output_dir results/ \
     --model_dir /path/to/alphafold3/model \
-    --rng_seed 42
+    --rng_seed 42 \
+    --num_diffusion_samples 1 \
+    --num_recycles 3
 ```
 
 ## Input Requirements
@@ -97,6 +100,31 @@ GGGRRRWWWK
 >peptide_003
 GGGLLLLLLK
 ```
+
+### Command Line Arguments
+
+- `--json_path`: Path to fold input JSON file (required)
+- `--peptide_chain_id`: Chain ID of the varying peptide chain (required)
+- `--peptide_sequences`: Path to FASTA file with peptide sequences (required)
+- `--output_dir`: Output directory for results (required)
+- `--model_dir`: Path to AlphaFold3 model directory (required)
+- `--rng_seed`: Random number generator seed (default: 42)
+- `--num_diffusion_samples`: Number of diffusion samples to generate (default: 1)
+- `--num_recycles`: Number of recycles during inference (default: 3)
+
+### Model Configuration Guidelines
+
+For **fast screening** (recommended for large libraries):
+- `--num_diffusion_samples 1` (fastest, still good quality)
+- `--num_recycles 3` (significant speedup vs default 10)
+
+For **high accuracy** (use for final candidates):
+- `--num_diffusion_samples 5` (AlphaFold3 default)
+- `--num_recycles 10` (AlphaFold3 default)
+
+**Performance impact**:
+- Each additional diffusion sample adds ~2-3 seconds per peptide
+- Each additional recycle adds ~0.5-1 second per peptide
 
 ## Implementation Details
 
