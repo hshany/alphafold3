@@ -25,6 +25,7 @@ import pathlib
 import time
 import sys
 import traceback
+import os
 from typing import Dict, List, Optional, Sequence
 
 import jax
@@ -42,6 +43,8 @@ from alphafold3.model import features
 from alphafold3.data import msa as msa_module
 from alphafold3.model import data3
 from alphafold3.model import data_constants
+from alphafold3.model import post_processing
+import alphafold3.cpp
 
 # Configure logging
 logging.basicConfig(
@@ -268,6 +271,77 @@ def update_batch_for_new_peptide(
     return updated_batch
 
 
+def _sanitize_name(name: str) -> str:
+    """Sanitize a name for safe filesystem usage."""
+    safe = []
+    for ch in name:
+        if ch.isalnum() or ch in ["_", "-", "."]:
+            safe.append(ch)
+        else:
+            safe.append("_")
+    # Avoid empty names
+    out = "".join(safe).strip("._-")
+    return out or "variant"
+
+
+def write_variant_outputs(
+    *,
+    inference_results: Sequence[model.InferenceResult],
+    variant_dir: pathlib.Path,
+    job_name: str,
+    seed: int,
+) -> Dict:
+    """Write processed outputs for a variant, mirroring run_alphafold.write_outputs.
+
+    Returns a small summary dict with ranking scores and top selection.
+    """
+    variant_dir.mkdir(parents=True, exist_ok=True)
+
+    # Terms of use text (same source as run_alphafold.py)
+    output_terms = (
+        pathlib.Path(alphafold3.cpp.__file__).parent / 'OUTPUT_TERMS_OF_USE.md'
+    ).read_text()
+
+    ranking_scores = []
+    max_ranking_score = None
+    max_ranking_result = None
+
+    for sample_idx, result in enumerate(inference_results):
+        sample_dir = variant_dir / f'seed-{seed}_sample-{sample_idx}'
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        post_processing.write_output(
+            inference_result=result,
+            output_dir=sample_dir.as_posix(),
+            name=f'{job_name}_seed-{seed}_sample-{sample_idx}',
+        )
+        rs = float(result.metadata['ranking_score'])
+        ranking_scores.append((seed, sample_idx, rs))
+        if max_ranking_score is None or rs > max_ranking_score:
+            max_ranking_score = rs
+            max_ranking_result = result
+
+    # Write top-ranked output in the variant root and a ranking CSV
+    if max_ranking_result is not None:
+        post_processing.write_output(
+            inference_result=max_ranking_result,
+            output_dir=variant_dir.as_posix(),
+            terms_of_use=output_terms,
+            name=job_name,
+        )
+        import csv
+        with open(variant_dir / f'{job_name}_ranking_scores.csv', 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['seed', 'sample', 'ranking_score'])
+            writer.writerows(ranking_scores)
+
+    return {
+        'job_name': job_name,
+        'seed': seed,
+        'ranking_scores': ranking_scores,
+        'top_ranking_score': max_ranking_score,
+    }
+
+
 class OptimizedPeptideRunner:
     """Optimized runner for peptide variant screening."""
     
@@ -437,7 +511,9 @@ class OptimizedPeptideRunner:
                 'update': update_time,
                 'inference': inference_time,
                 'extract': extract_time
-            }
+            },
+            'seed': self.setup_seed,
+            'token_chain_ids': inference_results[0].metadata.get('token_chain_ids'),
         }
 
 
@@ -447,6 +523,71 @@ import os
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from run_alphafold import ModelRunner as AF3ModelRunner, make_model_config
+
+
+def _chain_index_mapping(token_chain_ids: Sequence[str]) -> Dict[str, int]:
+    """Builds chain_id -> chain_index mapping from token chain ids order of appearance."""
+    mapping: Dict[str, int] = {}
+    order = []
+    for cid in token_chain_ids:
+        if cid not in mapping:
+            mapping[cid] = len(mapping)
+            order.append(cid)
+    return mapping
+
+
+def _compute_best_sample_metrics(
+    inference_results: Sequence[model.InferenceResult],
+    peptide_chain_id: str,
+    receptor_chain_id: str,
+) -> Dict[str, float]:
+    """Compute metrics for the best-ranking sample among inference_results.
+
+    Returns dict with keys: ranking_score, plddt, pae, iptm.
+    - plddt: mean over peptide atoms only.
+    - pae: mean over PAE submatrix for peptide tokens only.
+    - iptm: chain-pair ipTM between peptide and receptor chains.
+    """
+    # Pick best by ranking_score
+    best = max(inference_results, key=lambda r: float(r.metadata.get('ranking_score', float('nan'))))
+
+    ranking_score = float(best.metadata.get('ranking_score', float('nan')))
+
+    # pLDDT over peptide atoms
+    atom_chain_ids = np.asarray(best.predicted_structure.chain_id)
+    atom_plddts = np.asarray(best.predicted_structure.atom_b_factor)
+    pep_atom_mask = atom_chain_ids == peptide_chain_id
+    plddt = float(np.nan) if pep_atom_mask.sum() == 0 else float(np.nanmean(atom_plddts[pep_atom_mask]))
+
+    # PAE peptide-only submatrix
+    token_chain_ids = list(best.metadata.get('token_chain_ids', []))
+    pep_token_idx = [i for i, cid in enumerate(token_chain_ids) if cid == peptide_chain_id]
+    pae = best.numerical_data.get('full_pae')
+    if pae is None or len(pep_token_idx) == 0:
+        pae_mean = float(np.nan)
+    else:
+        pae_sub = pae[np.ix_(pep_token_idx, pep_token_idx)]
+        pae_mean = float(np.nanmean(pae_sub))
+
+    # ipTM peptide vs receptor
+    chain_pair_iptm = best.metadata.get('chain_pair_iptm')
+    if chain_pair_iptm is None:
+        iptm = float(np.nan)
+    else:
+        chain_to_index = _chain_index_mapping(token_chain_ids)
+        pi = chain_to_index.get(peptide_chain_id)
+        ri = chain_to_index.get(receptor_chain_id)
+        if pi is None or ri is None:
+            iptm = float(np.nan)
+        else:
+            iptm = float(chain_pair_iptm[pi, ri])
+
+    return {
+        'ranking_score': ranking_score,
+        'plddt': plddt,
+        'pae': pae_mean,
+        'iptm': iptm,
+    }
 
 
 def main():
@@ -466,6 +607,8 @@ def main():
                        help='Number of diffusion samples to generate (default: 1)')
     parser.add_argument('--num_recycles', type=int, default=3,
                        help='Number of recycles to use during inference (default: 3)')
+    parser.add_argument('--receptor_chain_id', type=str, default='A',
+                       help='Receptor chain ID for ipTM calculation (default: A)')
     
     args = parser.parse_args()
     
@@ -493,8 +636,8 @@ def main():
     # Setup base system (expensive, done once)
     runner.setup_base_system(fold_input, args.peptide_chain_id)
     
-    # Process all peptide variants
-    results = []
+    # Process all peptide variants and collect CSV rows
+    csv_rows = []
     total_start = time.time()
     
     logger.info(f"Processing {len(peptide_sequences)} peptide variants...")
@@ -508,12 +651,36 @@ def main():
                 args.peptide_chain_id,
             )
             result['name'] = name
-            results.append(result)
-            
-            # Save intermediate results
-            output_file = args.output_dir / f"variant_{i+1:04d}_{name}.json"
-            with open(output_file, 'w') as f:
-                json.dump(result, f, indent=2, default=str)
+            # Write post-processed outputs to variant subdir
+            variant_slug = _sanitize_name(name)
+            variant_dir = args.output_dir / f"variant_{i+1:04d}_{variant_slug}"
+            job_name = f"{variant_slug}"
+            variant_summary = write_variant_outputs(
+                inference_results=result['inference_results'],
+                variant_dir=variant_dir,
+                job_name=job_name,
+                seed=result['seed'],
+            )
+            # Compute metrics for best-ranked model
+            metrics = _compute_best_sample_metrics(
+                result['inference_results'],
+                peptide_chain_id=args.peptide_chain_id,
+                receptor_chain_id=args.receptor_chain_id,
+            )
+            # Compose timing as a single string
+            t = result['timing']
+            timing_str = f"total={t['total']:.2f},update={t['update']:.2f},inference={t['inference']:.2f},extract={t['extract']:.2f}"
+            csv_rows.append([
+                name,
+                result['sequence'],
+                result['seed'],
+                timing_str,
+                variant_dir.as_posix(),
+                f"{metrics['ranking_score']:.4f}" if np.isfinite(metrics['ranking_score']) else '',
+                f"{metrics['plddt']:.2f}" if np.isfinite(metrics['plddt']) else '',
+                f"{metrics['iptm']:.4f}" if np.isfinite(metrics['iptm']) else '',
+                f"{metrics['pae']:.2f}" if np.isfinite(metrics['pae']) else '',
+            ])
                 
         except Exception as e:
             logger.error(f"Failed to process variant {name}: {e}")
@@ -522,25 +689,23 @@ def main():
             continue
     
     total_time = time.time() - total_start
-    
-    # Save summary
-    summary = {
-        'total_variants': len(peptide_sequences),
-        'successful_variants': len(results),
-        'total_time_seconds': total_time,
-        'average_time_per_variant': total_time / len(results) if results else 0,
-        'results': results
-    }
-    
-    summary_file = args.output_dir / "screening_summary.json"
-    with open(summary_file, 'w') as f:
-        json.dump(summary, f, indent=2, default=str)
+    # Write CSV summary
+    import csv
+    summary_csv = args.output_dir / "screening_summary.csv"
+    with open(summary_csv, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            'name', 'sequence', 'seed', 'timing', 'variant_dir',
+            'ranking_score', 'plddt_peptide_mean', 'iptm_peptide_vs_receptor', 'pae_peptide_mean'
+        ])
+        writer.writerows(csv_rows)
     
     logger.info(f"Screening completed!")
-    logger.info(f"Processed {len(results)}/{len(peptide_sequences)} variants successfully")
+    logger.info(f"Processed {len(csv_rows)}/{len(peptide_sequences)} variants successfully")
     logger.info(f"Total time: {total_time:.2f} seconds")
-    logger.info(f"Average time per variant: {total_time/len(results):.2f} seconds")
-    logger.info(f"Results saved to: {args.output_dir}")
+    avg = total_time/len(csv_rows) if csv_rows else 0.0
+    logger.info(f"Average time per variant: {avg:.2f} seconds")
+    logger.info(f"Summary CSV saved to: {summary_csv}")
 
 
 if __name__ == "__main__":
