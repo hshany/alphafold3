@@ -26,6 +26,7 @@ import time
 import sys
 import traceback
 import os
+import datetime
 from typing import Dict, List, Optional, Sequence
 
 import jax
@@ -39,12 +40,15 @@ from alphafold3.constants import residue_names
 from alphafold3.constants import mmcif_names
 from alphafold3.data import featurisation
 from alphafold3.model import model
+from alphafold3.model.pipeline import pipeline
 from alphafold3.model import features
 from alphafold3.data import msa as msa_module
 from alphafold3.model import data3
 from alphafold3.model import data_constants
 from alphafold3.model import post_processing
 import alphafold3.cpp
+from alphafold3.constants import mmcif_names as _mmcif
+from alphafold3.constants import chemical_components as _chem
 
 # Configure logging
 logging.basicConfig(
@@ -249,15 +253,27 @@ def update_batch_for_new_peptide(
                     len(pep_msa_row), len(peptide_positions)
                 )
 
-            new_msa_block = np.tile(pep_msa_row, (len(peptide_row_indices), 1))
-            new_del_block = np.tile(pep_del_row, (len(peptide_row_indices), 1))
+            # Construct new peptide blocks and overwrite the full peptide columns deterministically:
+            # 1) Set all MSA rows at peptide columns to GAP and deletions to 0
+            # 2) Write the peptide query row(s) exactly at the cached row indices
+            msa_dtype = updated_batch['msa'].dtype
+            del_dtype = updated_batch['deletion_matrix'].dtype
+            gap_idx = data_constants.MSA_GAP_IDX
 
-            updated_batch['msa'][np.ix_(peptide_row_indices, peptide_positions)] = new_msa_block.astype(np.int8)
-            updated_batch['deletion_matrix'][np.ix_(peptide_row_indices, peptide_positions)] = new_del_block.astype(np.int8)
+            # Only fill the peptide row(s) with the encoded query sequence; do not
+            # modify other rows at these columns to preserve original encoding.
 
+            # Now fill the peptide row(s) with the encoded query sequence
+            new_msa_block = np.tile(pep_msa_row, (len(peptide_row_indices), 1)).astype(msa_dtype)
+            new_del_block = np.tile(pep_del_row, (len(peptide_row_indices), 1)).astype(del_dtype)
+
+            updated_batch['msa'][np.ix_(peptide_row_indices, peptide_positions)] = new_msa_block
+            updated_batch['deletion_matrix'][np.ix_(peptide_row_indices, peptide_positions)] = new_del_block
+
+            # Recompute peptide column profile/deletion_mean from the new peptide MSA rows only
             prof = data3.get_profile_features(new_msa_block, new_del_block)
-            updated_batch['profile'][peptide_positions, :] = prof['profile'].astype(np.float32)
-            updated_batch['deletion_mean'][peptide_positions] = prof['deletion_mean'].astype(np.float32)
+            updated_batch['profile'][peptide_positions, :] = prof['profile'].astype(updated_batch['profile'].dtype)
+            updated_batch['deletion_mean'][peptide_positions] = prof['deletion_mean'].astype(updated_batch['deletion_mean'].dtype)
 
             logger.debug(
                 f"Updated peptide MSA rows {peptide_row_indices.tolist()} and columns {peptide_positions.tolist()}"
@@ -271,6 +287,179 @@ def update_batch_for_new_peptide(
     return updated_batch
 
 
+def _make_query_only_a3m(seq: str) -> str:
+    return f">query\n{seq}\n"
+
+
+def _fold_input_with_query_only_msas(
+    base_input: folding_input.Input,
+    *,
+    peptide_chain_id: str,
+    new_peptide_seq: str,
+) -> folding_input.Input:
+    import dataclasses as _dc
+    new_chains = []
+    for ch in base_input.chains:
+        if isinstance(ch, folding_input.ProteinChain):
+            if ch.id == peptide_chain_id:
+                new_chains.append(
+                    folding_input.ProteinChain(
+                        id=ch.id,
+                        sequence=new_peptide_seq,
+                        ptms=ch.ptms,
+                        paired_msa=_make_query_only_a3m(new_peptide_seq),
+                        unpaired_msa=_make_query_only_a3m(new_peptide_seq),
+                        templates=ch.templates,
+                    )
+                )
+            else:
+                new_chains.append(
+                    folding_input.ProteinChain(
+                        id=ch.id,
+                        sequence=ch.sequence,
+                        ptms=ch.ptms,
+                        paired_msa=_make_query_only_a3m(ch.sequence),
+                        unpaired_msa=_make_query_only_a3m(ch.sequence),
+                        templates=ch.templates,
+                    )
+                )
+        elif isinstance(ch, folding_input.RnaChain):
+            new_chains.append(
+                folding_input.RnaChain(
+                    id=ch.id,
+                    sequence=ch.sequence,
+                    paired_msa=_make_query_only_a3m(ch.sequence),
+                    unpaired_msa=_make_query_only_a3m(ch.sequence),
+                    templates=ch.templates,
+                )
+            )
+        else:
+            new_chains.append(ch)
+    return _dc.replace(base_input, chains=tuple(new_chains))
+
+def _featurise_input(
+    fold_input: folding_input.Input,
+    ccd: chemical_components.Ccd,
+    buckets: Sequence[int] | None,
+    ref_max_modified_date: datetime.date | None = None,
+    conformer_max_iterations: int | None = None,
+    resolve_msa_overlaps: bool = True,
+    verbose: bool = False,
+) -> Sequence[features.BatchDict]:
+  """Featurise the folding input.
+  Copied from data/featurisation.py with deterministic_frames=False
+
+  Args:
+    fold_input: The input to featurise.
+    ccd: The chemical components dictionary.
+    buckets: Bucket sizes to pad the data to, to avoid excessive re-compilation
+      of the model. If None, calculate the appropriate bucket size from the
+      number of tokens. If not None, must be a sequence of at least one integer,
+      in strictly increasing order. Will raise an error if the number of tokens
+      is more than the largest bucket size.
+    ref_max_modified_date: Optional maximum date that controls whether to allow
+      use of model coordinates for a chemical component from the CCD if RDKit
+      conformer generation fails and the component does not have ideal
+      coordinates set. Only for components that have been released before this
+      date the model coordinates can be used as a fallback.
+    conformer_max_iterations: Optional override for maximum number of iterations
+      to run for RDKit conformer search.
+    resolve_msa_overlaps: Whether to deduplicate unpaired MSA against paired
+      MSA. The default behaviour matches the method described in the AlphaFold 3
+      paper. Set this to false if providing custom paired MSA using the unpaired
+      MSA field to keep it exactly as is as deduplication against the paired MSA
+      could break the manually crafted pairing between MSA sequences.
+    verbose: Whether to print progress messages.
+
+  Returns:
+    A featurised batch for each rng_seed in the input.
+  """
+  featurisation.validate_fold_input(fold_input)
+
+  # Set up data pipeline for single use.
+  data_pipeline = pipeline.WholePdbPipeline(
+      config=pipeline.WholePdbPipeline.Config(
+          buckets=buckets,
+          ref_max_modified_date=ref_max_modified_date,
+          conformer_max_iterations=conformer_max_iterations,
+          resolve_msa_overlaps=resolve_msa_overlaps,
+          deterministic_frames=False
+      ),
+  )
+
+  batches = []
+  for rng_seed in fold_input.rng_seeds:
+    featurisation_start_time = time.time()
+    if verbose:
+      print(f'Featurising data with seed {rng_seed}.')
+    batch = data_pipeline.process_item(
+        fold_input=fold_input,
+        ccd=ccd,
+        random_state=np.random.RandomState(rng_seed),
+        random_seed=rng_seed,
+    )
+    if verbose:
+      print(
+          f'Featurising data with seed {rng_seed} took'
+          f' {time.time() - featurisation_start_time:.2f} seconds.'
+      )
+    batches.append(batch)
+
+  return batches
+
+
+def _featurise_input_single(
+    fold_input_inst: folding_input.Input,
+) -> features.BatchDict:
+    ccd = _chem.cached_ccd()
+    batches = _featurise_input(
+        fold_input=fold_input_inst,
+        ccd=ccd,
+        buckets=None,
+        ref_max_modified_date=None,
+        conformer_max_iterations=None,
+        resolve_msa_overlaps=True,
+        verbose=False,
+    )
+    if not batches:
+        raise RuntimeError("Featurisation produced no batches")
+    return batches[0]
+
+
+def build_variant_features_with_msa_merge(
+    *,
+    base_batch: features.BatchDict,
+    base_fold_input: folding_input.Input,
+    peptide_chain_id: str,
+    peptide_sequence: str,
+    peptide_positions: np.ndarray,
+    peptide_row_indices: Optional[np.ndarray],
+) -> features.BatchDict:
+    updated_input = _fold_input_with_query_only_msas(
+        base_fold_input, peptide_chain_id=peptide_chain_id, new_peptide_seq=peptide_sequence
+    )
+    fresh_batch = _featurise_input_single(updated_input)
+
+    updated_msa_batch = update_batch_for_new_peptide(
+        base_batch=base_batch,
+        new_sequence=peptide_sequence,
+        peptide_positions=peptide_positions,
+        chain_id=peptide_chain_id,
+        peptide_row_indices=peptide_row_indices,
+    )
+
+    for k in (
+        'msa',
+        'msa_mask',
+        'deletion_matrix',
+        'profile',
+        'deletion_mean',
+        'num_alignments',
+    ):
+        if k in updated_msa_batch:
+            fresh_batch[k] = updated_msa_batch[k]
+
+    return fresh_batch
 def _sanitize_name(name: str) -> str:
     """Sanitize a name for safe filesystem usage."""
     safe = []
@@ -397,6 +586,8 @@ class OptimizedPeptideRunner:
         self.base_batch = featurised_examples[0]  # Use first example
         feat_time = time.time() - feat_start
         logger.info(f"Featurization completed in {feat_time:.2f} seconds")
+        # Stash the original fold_input to enable fresh re-featurisation per variant.
+        self.base_fold_input = fold_input
         
         # Initialize model runner with custom config
         logger.info("Initializing model runner...")
@@ -408,21 +599,18 @@ class OptimizedPeptideRunner:
         )
         self.model_runner = AF3ModelRunner(config, self.device, self.model_dir)
         
-        # Create chain mapping from fold_input for better chain tracking
-        self.chain_mapping = create_chain_mapping_from_fold_input(fold_input)
-        
-        # Find peptide chain positions
+        # Prefer deriving chain positions from the featurised layout for reliability.
         logger.info(f"Finding positions for peptide chain: {peptide_chain_id}")
+        self.peptide_positions = find_chain_token_positions(self.base_batch, peptide_chain_id)
+        if self.peptide_positions.size == 0:
+            # Fallback to fold_input order/lengths mapping if needed.
+            logger.warning("Falling back to fold_input-derived chain mapping for peptide positions.")
+            chain_mapping = create_chain_mapping_from_fold_input(fold_input)
+            if peptide_chain_id in chain_mapping:
+                start_token, end_token = chain_mapping[peptide_chain_id]
+                self.peptide_positions = np.arange(start_token, end_token, dtype=np.int32)
+        logger.info(f"Found {len(self.peptide_positions)} peptide positions")
         
-        # Try using chain mapping first
-        if peptide_chain_id in self.chain_mapping:
-            start_token, end_token = self.chain_mapping[peptide_chain_id]
-            self.peptide_positions = np.arange(start_token, end_token, dtype=np.int32)
-            logger.info(f"Using chain mapping: found {len(self.peptide_positions)} peptide positions")
-        else:
-            # Fallback to batch analysis
-            self.peptide_positions = find_chain_token_positions(self.base_batch, peptide_chain_id)
-            logger.info(f"Using batch analysis: found {len(self.peptide_positions)} peptide positions")
         
         # Cache peptide MSA row indices where peptide columns are non-gap
         try:
@@ -433,9 +621,37 @@ class OptimizedPeptideRunner:
                 self.peptide_row_indices = np.array([], dtype=np.int32)
                 logger.warning("No peptide positions found; cannot cache peptide MSA rows.")
             else:
-                peptide_row_mask = (msa_arr[:, pep_cols] != gap_idx).any(axis=1)
-                self.peptide_row_indices = np.where(peptide_row_mask)[0].astype(np.int32)
-                logger.info(f"Cached {len(self.peptide_row_indices)} peptide MSA row(s)")
+                # Prefer rows that contain the full peptide (no gaps) in these columns.
+                non_gap_counts = (msa_arr[:, pep_cols] != gap_idx).sum(axis=1)
+                pep_len = int(len(pep_cols))
+                full_rows = np.where(non_gap_counts == pep_len)[0]
+
+                if full_rows.size > 0:
+                    # Expectation for user workflow: peptide MSA is a single query row.
+                    chosen = full_rows[:1].astype(np.int32)
+                    if full_rows.size > 1:
+                        logger.warning(
+                            "Multiple MSA rows (%d) contain full non-gap peptide columns; using first row index %d.",
+                            full_rows.size, int(chosen[0])
+                        )
+                else:
+                    # Fallback: pick the row with maximum non-gaps among peptide columns, if any.
+                    max_count = int(non_gap_counts.max())
+                    if max_count == 0:
+                        chosen = np.array([], dtype=np.int32)
+                        logger.warning(
+                            "No non-gap residues detected in peptide columns across MSA rows; cannot cache peptide MSA row."
+                        )
+                    else:
+                        best = int(np.argmax(non_gap_counts))
+                        chosen = np.array([best], dtype=np.int32)
+                        logger.warning(
+                            "No full peptide row found; selected row %d with %d/%d non-gaps for peptide columns.",
+                            best, max_count, pep_len
+                        )
+
+                self.peptide_row_indices = chosen
+                logger.info(f"Cached {len(self.peptide_row_indices)} peptide MSA row(s): {self.peptide_row_indices.tolist()}")
         except Exception as e:
             logger.warning(f"Failed to cache peptide MSA row indices: {e}")
             self.peptide_row_indices = np.array([], dtype=np.int32)
@@ -470,12 +686,13 @@ class OptimizedPeptideRunner:
         
         # Update batch for new peptide
         update_start = time.time()
-        updated_batch = update_batch_for_new_peptide(
-            self.base_batch,
-            peptide_sequence, 
-            self.peptide_positions,
-            peptide_chain_id,
-            self.peptide_row_indices,
+        updated_batch = build_variant_features_with_msa_merge(
+            base_batch=self.base_batch,
+            base_fold_input=self.base_fold_input,
+            peptide_chain_id=peptide_chain_id,
+            peptide_sequence=peptide_sequence,
+            peptide_positions=self.peptide_positions,
+            peptide_row_indices=self.peptide_row_indices,
         )
         update_time = time.time() - update_start
         

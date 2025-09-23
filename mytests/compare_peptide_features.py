@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import logging
 import pathlib
 import sys
 from typing import Any, Dict, Iterable, Tuple
@@ -30,6 +31,15 @@ import numpy as np
 # Allow running from repo root without installing.
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, (REPO_ROOT / 'src').as_posix())
+# Also add repo root to import the screening script directly.
+sys.path.insert(0, REPO_ROOT.as_posix())
+
+# Set up console logging early so imported modules won't override it.
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+)
+logger = logging.getLogger('compare_peptide_features')
 
 from alphafold3.common import folding_input
 from alphafold3.constants import chemical_components
@@ -75,7 +85,67 @@ def _make_query_only_a3m(seq: str) -> str:
     return f">query\n{seq}\n"
 
 
-def _build_original_features(
+def _build_fresh_features_query_only(
+    base_input: folding_input.Input,
+    peptide_chain_id: str,
+    peptide_seq: str,
+) -> features.BatchDict:
+    new_chains = []
+    for ch in base_input.chains:
+        if isinstance(ch, folding_input.ProteinChain):
+            if ch.id == peptide_chain_id:
+                new_chains.append(
+                    folding_input.ProteinChain(
+                        id=ch.id,
+                        sequence=peptide_seq,
+                        ptms=ch.ptms,
+                        paired_msa=_make_query_only_a3m(peptide_seq),
+                        unpaired_msa=_make_query_only_a3m(peptide_seq),
+                        templates=ch.templates,
+                    )
+                )
+            else:
+                new_chains.append(
+                    folding_input.ProteinChain(
+                        id=ch.id,
+                        sequence=ch.sequence,
+                        ptms=ch.ptms,
+                        paired_msa=_make_query_only_a3m(ch.sequence),
+                        unpaired_msa=_make_query_only_a3m(ch.sequence),
+                        templates=ch.templates,
+                    )
+                )
+        elif isinstance(ch, folding_input.RnaChain):
+            new_chains.append(
+                folding_input.RnaChain(
+                    id=ch.id,
+                    sequence=ch.sequence,
+                    paired_msa=_make_query_only_a3m(ch.sequence),
+                    unpaired_msa=_make_query_only_a3m(ch.sequence),
+                    templates=ch.templates,
+                )
+            )
+        else:
+            new_chains.append(ch)
+
+    mod_input = dataclasses.replace(base_input, chains=tuple(new_chains))
+
+    ccd = chemical_components.cached_ccd()
+    batches = featurisation.featurise_input(
+        fold_input=mod_input,
+        ccd=ccd,
+        buckets=None,
+        ref_max_modified_date=None,
+        conformer_max_iterations=None,
+        resolve_msa_overlaps=True,
+        verbose=False,
+    )
+    if not batches:
+        raise RuntimeError('Featurisation produced no batches')
+    return batches[0]
+
+
+def _build_fresh_features_query_only(
     base_input: folding_input.Input,
     peptide_chain_id: str,
     peptide_seq: str,
@@ -121,72 +191,60 @@ def _build_original_features(
     return batches[0]
 
 
-def _build_partial_update_features(
+def _build_merged_features(
+    base_input: folding_input.Input,
     base_batch: features.BatchDict,
-    peptide_token_positions: np.ndarray,
+    peptide_chain_id: str,
     peptide_seq: str,
+    peptide_token_positions: np.ndarray,
 ) -> features.BatchDict:
-    """Apply the same partial update as peptide_variant_screen.update_batch_for_new_peptide."""
-    # Deep-copy to avoid mutating shared state.
-    out: features.BatchDict = {}
-    for k, v in base_batch.items():
-        if isinstance(v, np.ndarray):
-            out[k] = v.copy()
-        else:
-            # Immutable or small scalars/strings are fine to reuse; if dicts appear, clone shallowly.
-            try:
-                import copy as _copy
-                out[k] = _copy.deepcopy(v)
-            except Exception:
-                out[k] = v
-
-    # Update aatype
-    new_aatype = _sequence_to_aatype(peptide_seq)
-    if 'aatype' not in out:
-        raise KeyError('aatype missing in base batch')
-    for i, pos in enumerate(peptide_token_positions):
-        if i >= len(new_aatype):
-            break
-        out['aatype'][pos] = new_aatype[i]
-
-    # Update MSA rows where peptide columns are non-gap
     try:
-        from alphafold3.model import data_constants
-
-        pep_cols = peptide_token_positions
-        msa_arr = out['msa']  # (msa_rows, num_tokens)
-        gap_idx = data_constants.MSA_GAP_IDX
-        if pep_cols.size > 0:
-            peptide_row_mask = (msa_arr[:, pep_cols] != gap_idx).any(axis=1)
-            row_idx = np.where(peptide_row_mask)[0].astype(np.int32)
-        else:
-            row_idx = np.array([], dtype=np.int32)
-
-        if pep_cols.size > 0 and row_idx.size > 0:
-            # Encode the query-only sequence into Msa features
-            a3m = _make_query_only_a3m(peptide_seq)
-            pep_msa = msa_module.Msa.from_a3m(
-                query_sequence=peptide_seq,
-                chain_poly_type=mmcif_names.PROTEIN_CHAIN,
-                a3m=a3m,
-                deduplicate=False,
-            )
-            pep_feats = pep_msa.featurize()
-            pep_msa_row = pep_feats['msa'][0]
-            pep_del_row = pep_feats['deletion_matrix'][0]
-            new_msa_block = np.tile(pep_msa_row, (row_idx.size, 1))
-            new_del_block = np.tile(pep_del_row, (row_idx.size, 1))
-
-            out['msa'][np.ix_(row_idx, pep_cols)] = new_msa_block.astype(out['msa'].dtype)
-            out['deletion_matrix'][np.ix_(row_idx, pep_cols)] = new_del_block.astype(out['deletion_matrix'].dtype)
-
-            prof = data3.get_profile_features(new_msa_block, new_del_block)
-            out['profile'][pep_cols, :] = prof['profile'].astype(out['profile'].dtype)
-            out['deletion_mean'][pep_cols] = prof['deletion_mean'].astype(out['deletion_mean'].dtype)
+        from peptide_variant_screen import build_variant_features_with_msa_merge
     except Exception as e:
-        print(f"WARNING: MSA/profile update failed: {e}")
+        raise ImportError(f"Failed to import build_variant_features_with_msa_merge: {e}.")
 
-    return out
+    from alphafold3.model import data_constants
+    pep_cols = peptide_token_positions
+    if pep_cols is None or pep_cols.size == 0:
+        peptide_row_indices = np.array([], dtype=np.int32)
+    else:
+        msa_arr = base_batch['msa']
+        gap_idx = data_constants.MSA_GAP_IDX
+        non_gap_counts = (msa_arr[:, pep_cols] != gap_idx).sum(axis=1)
+        pep_len = int(len(pep_cols))
+        full_rows = np.where(non_gap_counts == pep_len)[0]
+        if full_rows.size > 0:
+            peptide_row_indices = full_rows[:1].astype(np.int32)
+        else:
+            max_count = int(non_gap_counts.max()) if non_gap_counts.size else 0
+            if max_count == 0:
+                peptide_row_indices = np.array([], dtype=np.int32)
+            else:
+                best = int(np.argmax(non_gap_counts))
+                peptide_row_indices = np.array([best], dtype=np.int32)
+
+    logger.info(
+        "Peptide row selection: pep_len=%d, chosen_rows=%s",
+        int(len(peptide_token_positions)),
+        peptide_row_indices.tolist() if peptide_row_indices.size else []
+    )
+
+    merged = build_variant_features_with_msa_merge(
+        base_batch=base_batch,
+        base_fold_input=base_input,
+        peptide_chain_id=peptide_chain_id,
+        peptide_sequence=peptide_seq,
+        peptide_positions=pep_cols,
+        peptide_row_indices=peptide_row_indices,
+    )
+    logger.info(
+        "Built merged features: peptide length %d, columns %d",
+        len(peptide_seq), pep_cols.size if pep_cols is not None else 0
+    )
+    return merged
+
+
+
 
 
 def _compare_batches(a: features.BatchDict, b: features.BatchDict, *, atol: float = 0.0, rtol: float = 0.0) -> Dict[str, Any]:
@@ -260,6 +318,7 @@ def main():
     p.add_argument('--peptide', type=str, required=True, help='Peptide sequence')
     p.add_argument('--peptide_chain_id', type=str, default=None, help='Chain id of peptide (optional)')
     p.add_argument('--dump_json', type=pathlib.Path, default=None, help='Optional path to dump comparison JSON')
+    p.add_argument('--dump_arrays_dir', type=pathlib.Path, default=None, help='Optional directory to save msa arrays')
     args = p.parse_args()
 
     base_input = _load_fold_input(args.json)
@@ -280,7 +339,7 @@ def main():
     print(f"Peptide chain id: {peptide_chain_id}")
 
     # Original features for the peptide sequence
-    orig_batch = _build_original_features(
+    orig_batch = _build_fresh_features_query_only(
         base_input=base_input,
         peptide_chain_id=peptide_chain_id,
         peptide_seq=args.peptide,
@@ -308,10 +367,12 @@ def main():
     pep_positions = np.arange(start, end, dtype=np.int32)
 
     # Partial update on base batch
-    part_batch = _build_partial_update_features(
+    part_batch = _build_merged_features(
+        base_input=base_input,
         base_batch=base_batch,
-        peptide_token_positions=pep_positions,
+        peptide_chain_id=peptide_chain_id,
         peptide_seq=args.peptide,
+        peptide_token_positions=pep_positions,
     )
 
     # Compare feature dicts
@@ -333,6 +394,21 @@ def main():
         print('\nAll common keys match exactly.')
 
     print(f"\nMatched keys: {len(diffs['match'])}, Mismatched: {len(mismatches)}")
+
+    # Save arrays for inspection (msa arrays by default)
+    arrays_dir: pathlib.Path | None = None
+    if args.dump_arrays_dir is not None:
+        arrays_dir = args.dump_arrays_dir
+    elif args.dump_json is not None:
+        arrays_dir = args.dump_json.parent
+
+    if arrays_dir is not None:
+        arrays_dir.mkdir(parents=True, exist_ok=True)
+        msa_partial_path = arrays_dir / 'msa_partial.npy'
+        msa_original_path = arrays_dir / 'msa_original.npy'
+        np.save(msa_partial_path.as_posix(), part_batch['msa'])
+        np.save(msa_original_path.as_posix(), orig_batch['msa'])
+        print(f"Saved MSA arrays to: {msa_partial_path} and {msa_original_path}")
 
     if args.dump_json:
         with open(args.dump_json, 'w') as f:
