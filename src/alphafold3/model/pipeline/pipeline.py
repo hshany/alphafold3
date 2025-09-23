@@ -8,12 +8,20 @@
 # if received directly from Google. Use is subject to terms of use available at
 # https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md
 
-"""The main featurizer."""
+"""The main featurizer.
+
+This file is temporarily instrumented with fine-grained timing logs to help
+benchmark featurisation step costs. Enable by setting the environment variable
+`AF3_FEAT_TIMING=1`. These changes are intended for local benchmarking and can
+be reverted easily with git.
+"""
 
 import bisect
 from collections.abc import Sequence
 import datetime
 import itertools
+import os
+import time
 
 from absl import logging
 from alphafold3.common import base_config
@@ -164,6 +172,9 @@ class WholePdbPipeline:
       random_seed: int | None = None,
   ) -> features.BatchDict:
     """Takes requests from in_queue, adds (key, serialized ex) to out_queue."""
+    enable_timing = os.environ.get('AF3_FEAT_TIMING', '0') == '1'
+    timings: dict[str, float] = {}
+    _t_prev = time.time()
     if random_seed is None:
       random_seed = random_state.randint(2**31)
 
@@ -190,6 +201,9 @@ class WholePdbPipeline:
         remove_bad_bonds=True,
         remove_nonsymmetric_bonds=self._config.remove_nonsymmetric_bonds,
     )
+    if enable_timing:
+      timings['structure_cleaning'] = time.time() - _t_prev
+      _t_prev = time.time()
 
     num_clashing_chains_removed = cleaning_metadata[
         'num_clashing_chains_removed'
@@ -213,6 +227,9 @@ class WholePdbPipeline:
             allow_multiple_bonds_per_atom=True,
         )
     )
+    if enable_timing:
+      timings['inter_chain_bonds'] = time.time() - _t_prev
+      _t_prev = time.time()
 
     # If empty replace with None as this causes errors downstream.
     if ligand_ligand_bonds and not ligand_ligand_bonds.atom_name.size:
@@ -230,6 +247,9 @@ class WholePdbPipeline:
             drop_ligand_leaving_atoms=self._config.drop_ligand_leaving_atoms,
         )
     )
+    if enable_timing:
+      timings['create_empty_output_layout'] = time.time() - _t_prev
+      _t_prev = time.time()
 
     # Select the tokens for Evoformer.
     # Each token (e.g. a residue) is encoded as one representative atom. This
@@ -244,6 +264,9 @@ class WholePdbPipeline:
             logging_name=logging_name,
         )
     )
+    if enable_timing:
+      timings['tokenizer'] = time.time() - _t_prev
+      _t_prev = time.time()
     total_tokens = len(all_tokens.atom_name)
     if (
         self._config.max_total_residues
@@ -291,6 +314,9 @@ class WholePdbPipeline:
         num_templates=self._config.max_templates,
         num_atoms=num_atoms,
     )
+    if enable_timing:
+      timings['bucket_and_padding_shapes'] = time.time() - _t_prev
+      _t_prev = time.time()
 
     # Create the atom layouts for flat atom cross attention
     batch_atom_cross_att = features.AtomCrossAtt.compute_features(
@@ -299,12 +325,18 @@ class WholePdbPipeline:
         keys_subset_size=self._config.atom_cross_att_keys_subset_size,
         padding_shapes=padding_shapes,
     )
+    if enable_timing:
+      timings['atom_cross_attention_features'] = time.time() - _t_prev
+      _t_prev = time.time()
 
     # Extract per-token features
     batch_token_features = features.TokenFeatures.compute_features(
         all_tokens=all_tokens,
         padding_shapes=padding_shapes,
     )
+    if enable_timing:
+      timings['token_features'] = time.time() - _t_prev
+      _t_prev = time.time()
 
     # Create reference structure features
     chemical_components_data = struc_chem_comps.populate_missing_ccd_data(
@@ -317,6 +349,9 @@ class WholePdbPipeline:
     empty_output_struc = empty_output_struc.copy_and_update_globals(
         chemical_components_data=chemical_components_data
     )
+    if enable_timing:
+      timings['populate_ccd_and_update_smiles'] = time.time() - _t_prev
+      _t_prev = time.time()
     # Create layouts and store structures for model output conversion.
     batch_convert_model_output = features.ConvertModelOutput.compute_features(
         all_token_atoms_layout=all_token_atoms_layout,
@@ -327,6 +362,9 @@ class WholePdbPipeline:
         polymer_ligand_bonds=polymer_ligand_bonds,
         ligand_ligand_bonds=ligand_ligand_bonds,
     )
+    if enable_timing:
+      timings['convert_model_output_features'] = time.time() - _t_prev
+      _t_prev = time.time()
 
     # Create the PredictedStructureInfo
     batch_predicted_structure_info = (
@@ -336,6 +374,9 @@ class WholePdbPipeline:
             padding_shapes=padding_shapes,
         )
     )
+    if enable_timing:
+      timings['predicted_structure_info'] = time.time() - _t_prev
+      _t_prev = time.time()
 
     # Create MSA features
     batch_msa = features.MSA.compute_features(
@@ -347,6 +388,9 @@ class WholePdbPipeline:
         max_paired_sequence_per_species=self._config.max_paired_sequence_per_species,
         resolve_msa_overlaps=self._config.resolve_msa_overlaps,
     )
+    if enable_timing:
+      timings['msa_features'] = time.time() - _t_prev
+      _t_prev = time.time()
 
     # Create template features
     batch_templates = features.Templates.compute_features(
@@ -357,6 +401,9 @@ class WholePdbPipeline:
         max_templates=self._config.max_templates,
         logging_name=logging_name,
     )
+    if enable_timing:
+      timings['template_features'] = time.time() - _t_prev
+      _t_prev = time.time()
 
     ref_max_modified_date = self._config.ref_max_modified_date
     conformer_max_iterations = self._config.conformer_max_iterations
@@ -372,6 +419,9 @@ class WholePdbPipeline:
             ligand_ligand_bonds=ligand_ligand_bonds,
         )
     )
+    if enable_timing:
+      timings['ref_structure'] = time.time() - _t_prev
+      _t_prev = time.time()
     deterministic_ref_structure = None
     if self._config.deterministic_frames:
       deterministic_ref_structure, _ = features.RefStructure.compute_features(
@@ -386,6 +436,9 @@ class WholePdbPipeline:
           conformer_max_iterations=None,
           ligand_ligand_bonds=ligand_ligand_bonds,
       )
+      if enable_timing:
+        timings['deterministic_ref_structure'] = time.time() - _t_prev
+        _t_prev = time.time()
 
     # Create ligand-polymer bond features.
     polymer_ligand_bond_info = features.PolymerLigandBondInfo.compute_features(
@@ -394,12 +447,18 @@ class WholePdbPipeline:
         bond_layout=polymer_ligand_bonds,
         padding_shapes=padding_shapes,
     )
+    if enable_timing:
+      timings['polymer_ligand_bond_info'] = time.time() - _t_prev
+      _t_prev = time.time()
     # Create ligand-ligand bond features.
     ligand_ligand_bond_info = features.LigandLigandBondInfo.compute_features(
         all_tokens,
         ligand_ligand_bonds,
         padding_shapes,
     )
+    if enable_timing:
+      timings['ligand_ligand_bond_info'] = time.time() - _t_prev
+      _t_prev = time.time()
 
     # Create the Pseudo-beta layout for distogram head and distance error head.
     batch_pseudo_beta_info = features.PseudoBetaInfo.compute_features(
@@ -408,6 +467,9 @@ class WholePdbPipeline:
         padding_shapes=padding_shapes,
         logging_name=logging_name,
     )
+    if enable_timing:
+      timings['pseudo_beta_info'] = time.time() - _t_prev
+      _t_prev = time.time()
 
     # Frame construction.
     batch_frames = features.Frames.compute_features(
@@ -420,6 +482,9 @@ class WholePdbPipeline:
         ),
         padding_shapes=padding_shapes,
     )
+    if enable_timing:
+      timings['frames'] = time.time() - _t_prev
+      _t_prev = time.time()
 
     # Assemble the Batch object.
     batch = feat_batch.Batch(
@@ -435,6 +500,9 @@ class WholePdbPipeline:
         convert_model_output=batch_convert_model_output,
         frames=batch_frames,
     )
+    if enable_timing:
+      timings['assemble_batch'] = time.time() - _t_prev
+      _t_prev = time.time()
 
     np_example = batch.as_data_dict()
     if 'num_iter_recycling' in np_example:
@@ -451,5 +519,17 @@ class WholePdbPipeline:
             f'nan feature: {name}, fold input name: {fold_input.name}, '
             f'random_seed {random_seed}'
         )
+
+    if enable_timing:
+      timings['validate_and_finalize'] = time.time() - _t_prev
+      # Log a concise per-step breakdown and total time.
+      total_time = sum(timings.values())
+      breakdown = ' | '.join(f"{k}={v:.3f}s" for k, v in timings.items())
+      logging.info(
+          'Featurisation timings for %s: total=%.3fs | %s',
+          logging_name,
+          total_time,
+          breakdown,
+      )
 
     return np_example
