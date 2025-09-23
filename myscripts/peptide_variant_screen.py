@@ -737,7 +737,10 @@ class OptimizedPeptideRunner:
 # Import the actual ModelRunner from run_alphafold.py
 import sys
 import os
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_ROOT_DIR = os.path.dirname(_THIS_DIR)
+if _ROOT_DIR not in sys.path:
+    sys.path.insert(0, _ROOT_DIR)
 
 from run_alphafold import ModelRunner as AF3ModelRunner, make_model_config
 
