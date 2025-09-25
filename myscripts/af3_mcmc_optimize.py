@@ -73,6 +73,7 @@ class AF3MCMCEvaluator:
         num_recycles: int = 3,
         loss_cfg: Optional[LossConfig] = None,
         output_dir: Optional[pathlib.Path] = None,
+        mutation_bias: str = "uniform",  # 'uniform' or 'peptide_plddt'
     ) -> None:
         self.json_path = pathlib.Path(json_path)
         self.model_dir = pathlib.Path(model_dir)
@@ -82,6 +83,7 @@ class AF3MCMCEvaluator:
         self.num_recycles = int(num_recycles)
         self.loss_cfg = loss_cfg or LossConfig()
         self.output_dir = pathlib.Path(output_dir) if output_dir else None
+        self.mutation_bias = mutation_bias
 
         # Setup base system
         self.fold_input = load_fold_input(self.json_path)
@@ -143,11 +145,50 @@ class AF3MCMCEvaluator:
         )
         loss = self._compute_loss(metrics)
 
-        # For now, omit per-position confidence (uniform mutation bias)
+        # Optional per-position mutation bias from peptide residue pLDDT
+        pos_conf: Optional[Sequence[float]] = None
+        if self.mutation_bias == 'peptide_plddt':
+            try:
+                # Use best-ranked sample for per-residue stats
+                best = max(inf_results, key=lambda r: float(r.metadata.get('ranking_score', float('nan'))))
+                atom_chain_ids = best.predicted_structure.chain_id
+                atom_b = best.predicted_structure.atom_b_factor  # pLDDT per atom, 0..100
+                atom_res_ids = best.predicted_structure.res_id
+                import numpy as _np
+                # Collect per-residue b-factors for the peptide chain
+                mask = _np.asarray(atom_chain_ids) == self.peptide_chain_id
+                pep_res_ids = _np.asarray(atom_res_ids)[mask]
+                pep_b = _np.asarray(atom_b)[mask]
+                # Order by residue id and average per residue
+                if pep_res_ids.size > 0:
+                    order = _np.argsort(pep_res_ids)
+                    res_ids_sorted = pep_res_ids[order]
+                    b_sorted = pep_b[order]
+                    uniq_ids, starts = _np.unique(res_ids_sorted, return_index=True)
+                    # Compute mean per residue id
+                    means = []
+                    for i, start in enumerate(starts):
+                        end = starts[i + 1] if i + 1 < len(starts) else len(b_sorted)
+                        means.append(float(_np.nanmean(b_sorted[start:end])))
+                    # Map to peptide length by order
+                    pep_len = len(peptide_sequence)
+                    # If mismatch, pad/truncate
+                    if len(means) < pep_len:
+                        means = means + [float('nan')] * (pep_len - len(means))
+                    elif len(means) > pep_len:
+                        means = means[:pep_len]
+                    # Convert to [0,1]
+                    plddt01 = [min(max(m / 100.0, 0.0), 1.0) if m == m else float('nan') for m in means]
+                    # The MCMC skeleton uses weights ~ (1 - pos_confidence).
+                    # For probability proportional to (1 - pLDDT), set pos_confidence = pLDDT.
+                    pos_conf = plddt01
+            except Exception:
+                pos_conf = None
+
         out = {
             'loss': float(loss),
             'metrics': metrics,
-            # 'pos_confidence': [...],  # optional future enhancement
+            'pos_confidence': pos_conf,  # used if mutation_bias == 'peptide_plddt'
             'inference_results': inf_results,
             'seed': run_out.get('seed'),
         }
@@ -181,6 +222,9 @@ def main() -> None:
     p.add_argument('--w_plddt', type=float, default=0.0)
     p.add_argument('--w_iptm', type=float, default=0.0)
     p.add_argument('--w_pae', type=float, default=0.0)
+    # Mutation biasing
+    p.add_argument('--mutation_bias', type=str, choices=['uniform', 'peptide_plddt'], default='uniform',
+                   help='If peptide_plddt, bias mutation probability proportional to (1 - per-residue peptide pLDDT)')
 
     args = p.parse_args()
 
@@ -210,6 +254,7 @@ def main() -> None:
         num_recycles=args.num_recycles,
         loss_cfg=loss_cfg,
         output_dir=args.output_dir,
+        mutation_bias=args.mutation_bias,
     )
 
     init_seq = args.init_seq or evaluator.initial_seq
@@ -219,12 +264,78 @@ def main() -> None:
     )
     log.info("Loss mode: %s (w_rank=%.3g, w_plddt=%.3g, w_iptm=%.3g, w_pae=%.3g)",
              loss_cfg.mode, loss_cfg.w_rank, loss_cfg.w_plddt, loss_cfg.w_iptm, loss_cfg.w_pae)
+    log.info("Mutation bias: %s", args.mutation_bias)
 
     # Adapter for MCMC skeleton
+    # Prepare CSV summary file that will be updated on-the-fly
+    import csv
+    summary_csv = args.output_dir / "mcmc_designs.csv"
+    if not summary_csv.exists():
+        with open(summary_csv, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'eval_idx', 'sequence', 'seed',
+                'ranking_score', 'iptm_pep_vs_rec', 'plddt_pep_mean', 'pae_pep_mean',
+                'loss', 'variant_dir'
+            ])
+
+    eval_counter = {'n': 0}
+
+    def _write_outputs_for_sequence(seq: str, cache_entry: Dict) -> None:
+        """Write AF3 outputs for this evaluated sequence and append CSV row.
+
+        Uses the best-ranked sample from `inference_results` for metrics.
+        """
+        eval_counter['n'] += 1
+        idx = eval_counter['n']
+
+        # Create a deterministic variant directory per evaluation
+        variant_dir = args.output_dir / f"iter_{idx:04d}"
+        job_name = f"iter_{idx:04d}"
+
+        # Write detailed outputs (model files, confidences, ranking CSV)
+        try:
+            write_variant_outputs(
+                inference_results=cache_entry['inference_results'],
+                variant_dir=variant_dir,
+                job_name=job_name,
+                seed=int(cache_entry.get('seed', 0) or 0),
+            )
+        except Exception as e:
+            log.warning(f"Failed to write outputs for eval {idx}: {e}")
+
+        # Metrics and CSV row
+        metrics = cache_entry.get('metrics', {})
+        row = [
+            idx,
+            seq,
+            int(cache_entry.get('seed', 0) or 0),
+            metrics.get('ranking_score'),
+            metrics.get('iptm'),
+            metrics.get('plddt'),
+            metrics.get('pae'),
+            float(cache_entry.get('loss', float('nan'))),
+            variant_dir.as_posix(),
+        ]
+        try:
+            with open(summary_csv, 'a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(row)
+        except Exception as e:
+            log.warning(f"Failed to append CSV for eval {idx}: {e}")
+
     def evaluate_fn(seq: str) -> Dict[str, float]:
         out = evaluator.evaluate(seq)
+        # Write outputs and append to CSV the first time we see this sequence
+        # Avoid duplicating work for cached sequences
+        cached = evaluator._cache.get(seq, {})
+        if cached is out and 'written' not in cached:
+            _write_outputs_for_sequence(seq, out)
+            cached['written'] = True
         # Return only the required keys to MCMC; keep metrics cached internally
         ret = {'loss': float(out['loss'])}
+        if args.mutation_bias == 'peptide_plddt' and out.get('pos_confidence') is not None:
+            ret['pos_confidence'] = out['pos_confidence']
         # pos_confidence optional; omit for now to use uniform proposal weights
         return ret
 
