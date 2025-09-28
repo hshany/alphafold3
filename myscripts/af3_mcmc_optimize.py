@@ -18,7 +18,8 @@ Example:
     --model_dir path/to/model \
     --peptide_chain_id C \
     --receptor_chain_id A \
-    --steps 100 --half_life 50 --T_init 0.5 --mutation_rate 1
+    --steps 100 --half_life 50 --T_init 0.5 --mutation_rate 1 \
+    --fixed_positions 1,5,-1
 """
 
 from __future__ import annotations
@@ -96,6 +97,11 @@ class AF3MCMCEvaluator:
 
         # Setup base system
         self.fold_input = load_fold_input(self.json_path)
+        # Preserve original peptide sequence (before any randomization)
+        try:
+            self.original_peptide_seq = self._get_chain_sequence(self.fold_input, self.peptide_chain_id)
+        except Exception:
+            self.original_peptide_seq = None
 
         # Apply random peptide initialization before any setup if requested
         rand_seq: Optional[str] = None
@@ -266,6 +272,8 @@ def main() -> None:
     p.add_argument('--T_init', type=float, default=0.5)
     p.add_argument('--mutation_rate', type=int, default=1)
     p.add_argument('--seed', type=int, default=None)
+    p.add_argument('--fixed_positions', type=str, default=None,
+                   help='Comma-separated list of positions to freeze (no mutation). Use 1-based indices from N-terminus (e.g., 1,5,10) or negative indices from C-terminus (e.g., -1,-2 for last and second-last). Fixed positions keep their identity from the fold-input peptide chain; with --random_init_len they are reset to the fold-input residues before starting MCMC.')
 
     # Loss configuration
     p.add_argument('--loss_mode', type=str, choices=['neg_ranking', 'composite'], default='neg_ranking')
@@ -317,6 +325,53 @@ def main() -> None:
         log.info("Random initialization enabled: length=%d seed=%s", args.random_init_len, str(args.seed))
     else:
         init_seq = args.init_seq or evaluator.initial_seq
+    # Resolve fixed positions after determining initial sequence
+    fixed_positions_0b = None
+    if args.fixed_positions:
+        def _parse_fixed_positions(spec: str, L: int) -> list[int]:
+            out: set[int] = set()
+            for tok in spec.replace(' ', '').split(','):
+                if not tok:
+                    continue
+                try:
+                    n = int(tok)
+                except ValueError:
+                    log.warning("Ignoring non-integer fixed position token: %r", tok)
+                    continue
+                if n == 0:
+                    log.warning("Ignoring zero index in --fixed_positions (use 1-based or negative).")
+                    continue
+                if n > 0:
+                    idx = n - 1
+                else:
+                    idx = L + n  # e.g., -1 -> L-1
+                if 0 <= idx < L:
+                    out.add(idx)
+                else:
+                    log.warning("Ignoring out-of-range fixed position %d for length %d", n, L)
+            return sorted(out)
+
+        fixed_positions_0b = _parse_fixed_positions(args.fixed_positions, len(init_seq))
+        log.info("Fixed positions (0-based): %s", ",".join(str(i) for i in fixed_positions_0b) if fixed_positions_0b else "<none>")
+
+        # If using random init, reset fixed sites to fold-input identities
+        if (args.random_init_len is not None and args.random_init_len > 0) and fixed_positions_0b:
+            ref_seq = getattr(evaluator, 'original_peptide_seq', None)
+            if ref_seq is None:
+                log.warning("Original peptide sequence unavailable; cannot reset fixed positions to fold-input identities.")
+            else:
+                L = len(init_seq)
+                if len(ref_seq) != L:
+                    log.warning(
+                        "Fold-input peptide length (%d) != random init length (%d); applying fixed identities only where in range.",
+                        len(ref_seq), L
+                    )
+                init_list = list(init_seq)
+                for i in fixed_positions_0b:
+                    if 0 <= i < min(len(ref_seq), L):
+                        init_list[i] = ref_seq[i]
+                init_seq = "".join(init_list)
+                log.info("Applied fold-input identities at fixed positions to initial sequence.")
     log.info(
         "MCMC setup: steps=%d, half_life=%.3g, T_init=%.3g, mutation_rate=%d, seed=%s, init_len=%d",
         args.steps, args.half_life, args.T_init, args.mutation_rate, str(args.seed), len(init_seq)
@@ -429,6 +484,7 @@ def main() -> None:
         config=cfg,
         progress_fn=progress_fn,
         log_every=1,
+        fixed_positions=fixed_positions_0b,
     )
 
     # Ensure best sequence is evaluated and write AF3 outputs

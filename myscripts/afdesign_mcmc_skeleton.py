@@ -44,25 +44,51 @@ def seq_idx_to_str(seq_idx: Sequence[int]) -> str:
 
 
 def default_position_weights(
-    length: int, pos_confidence: Optional[Sequence[float]] = None
+    length: int,
+    pos_confidence: Optional[Sequence[float]] = None,
+    fixed_positions: Optional[Sequence[int]] = None,
 ) -> List[float]:
     """
     Create mutation position weights.
     - If `pos_confidence` provided (e.g., pLDDT in [0,1]), use (1 - confidence).
     - Else, uniform over positions.
     """
+    # Base weights
     if pos_confidence is None:
-        return [1.0] * length
-    w = []
-    for c in pos_confidence:
-        if c is None or math.isnan(c):
-            w.append(0.0)
-        else:
-            w.append(max(1.0 - float(c), 0.0))
+        w = [1.0] * length
+    else:
+        w = []
+        for c in pos_confidence:
+            if c is None or math.isnan(c):
+                w.append(0.0)
+            else:
+                w.append(max(1.0 - float(c), 0.0))
+
+    # Zero out fixed positions (immutable)
+    if fixed_positions is not None:
+        for i in fixed_positions:
+            if 0 <= int(i) < length:
+                w[int(i)] = 0.0
+
     s = sum(w)
     if s <= 0:
-        # fall back to uniform if all zero
-        return [1.0] * length
+        # If everything is fixed (or all zero from confidence), try to assign
+        # uniform weights to mutable positions only. If none, raise.
+        w = [0.0] * length
+        if fixed_positions is None:
+            # no fixed positions, but zero weights -> uniform over all
+            w = [1.0] * length
+        else:
+            any_mutable = False
+            fixed_set = set(int(x) for x in fixed_positions)
+            for i in range(length):
+                if i not in fixed_set:
+                    w[i] = 1.0
+                    any_mutable = True
+            if not any_mutable:
+                raise ValueError("All positions are fixed; no mutable positions available for proposals.")
+        s = sum(w)
+    # Normalize
     return [x / s for x in w]
 
 
@@ -152,6 +178,7 @@ def run_mcmc_design(
     propose_fn: Callable[[Sequence[int], int, Optional[Sequence[float]], Optional[random.Random]], List[int]] = propose_mutation,
     progress_fn: Optional[Callable[[Dict[str, float]], None]] = None,
     log_every: int = 0,
+    fixed_positions: Optional[Sequence[int]] = None,
 ) -> MCMCResult:
     """
     Run MCMC with simulated annealing on sequences.
@@ -191,8 +218,10 @@ def run_mcmc_design(
     for step in range(config.steps):
         T = default_temperature(step, config.T_init, config.half_life)
 
-        # Prepare mutation position weights from confidence (optional)
-        pos_w = default_position_weights(len(current_seq_idx), pos_conf)
+        # Prepare mutation position weights from confidence (optional) and fixed mask
+        pos_w = default_position_weights(
+            len(current_seq_idx), pos_confidence=pos_conf, fixed_positions=fixed_positions
+        )
 
         # Propose mutation(s)
         if step == 0:
