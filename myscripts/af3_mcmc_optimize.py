@@ -45,6 +45,9 @@ from afdesign_mcmc_skeleton import (
     run_mcmc_design,
     MCMCConfig,
 )
+from alphafold3.common import folding_input as _folding_input
+import dataclasses as _dc
+import random as _random
 
 
 @dataclass
@@ -74,6 +77,8 @@ class AF3MCMCEvaluator:
         loss_cfg: Optional[LossConfig] = None,
         output_dir: Optional[pathlib.Path] = None,
         mutation_bias: str = "uniform",  # 'uniform' or 'peptide_plddt'
+        random_init_len: Optional[int] = None,
+        random_init_seed: Optional[int] = None,
     ) -> None:
         self.json_path = pathlib.Path(json_path)
         self.model_dir = pathlib.Path(model_dir)
@@ -85,8 +90,20 @@ class AF3MCMCEvaluator:
         self.output_dir = pathlib.Path(output_dir) if output_dir else None
         self.mutation_bias = mutation_bias
 
+        # Stash random init controls
+        self._random_init_len = int(random_init_len) if random_init_len else None
+        self._random_init_seed = int(random_init_seed) if random_init_seed is not None else None
+
         # Setup base system
         self.fold_input = load_fold_input(self.json_path)
+
+        # Apply random peptide initialization before any setup if requested
+        rand_seq: Optional[str] = None
+        if self._random_init_len is not None and self._random_init_len > 0:
+            self.fold_input, rand_seq = self._fold_input_with_random_peptide(
+                self.fold_input, self.peptide_chain_id, self._random_init_len, self._random_init_seed
+            )
+
         self.runner = OptimizedPeptideRunner(
             self.model_dir,
             num_diffusion_samples=self.num_diffusion_samples,
@@ -97,8 +114,8 @@ class AF3MCMCEvaluator:
         # Cache for evaluated sequences: seq -> {loss, metrics, inference_results}
         self._cache: Dict[str, Dict] = {}
 
-        # Determine initial sequence from fold_input if not provided later
-        self.initial_seq = self._get_chain_sequence(self.fold_input, self.peptide_chain_id)
+        # Determine initial sequence from fold_input or the random replacement
+        self.initial_seq = rand_seq or self._get_chain_sequence(self.fold_input, self.peptide_chain_id)
 
     @staticmethod
     def _get_chain_sequence(fold_input, chain_id: str) -> str:
@@ -195,6 +212,38 @@ class AF3MCMCEvaluator:
         self._cache[peptide_sequence] = out
         return out
 
+    @staticmethod
+    def _make_query_only_a3m(seq: str) -> str:
+        return f">query\n{seq}\n"
+
+    @staticmethod
+    def _fold_input_with_random_peptide(
+        base_input: _folding_input.Input,
+        peptide_chain_id: str,
+        length: int,
+        seed: Optional[int] = None,
+    ) -> tuple[_folding_input.Input, str]:
+        aa = "ACDEFGHIKLMNPQRSTVWY"
+        rng = _random.Random(seed)
+        rand_seq = "".join(rng.choice(aa) for _ in range(int(length)))
+
+        new_chains = []
+        for ch in base_input.chains:
+            if isinstance(ch, _folding_input.ProteinChain) and ch.id == peptide_chain_id:
+                new_chains.append(
+                    _folding_input.ProteinChain(
+                        id=ch.id,
+                        sequence=rand_seq,
+                        ptms=ch.ptms,
+                        paired_msa=AF3MCMCEvaluator._make_query_only_a3m(rand_seq),
+                        unpaired_msa=AF3MCMCEvaluator._make_query_only_a3m(rand_seq),
+                        templates=ch.templates,
+                    )
+                )
+            else:
+                new_chains.append(ch)
+        return _dc.replace(base_input, chains=tuple(new_chains)), rand_seq
+
 
 def main() -> None:
     p = argparse.ArgumentParser(description="AF3-backed MCMC sequence optimization")
@@ -210,6 +259,8 @@ def main() -> None:
 
     # MCMC knobs
     p.add_argument('--init_seq', type=str, default=None)
+    p.add_argument('--random_init_len', type=int, default=None,
+                   help='If set, initialize with a random peptide of this length and replace the peptide chain sequence + single-sequence MSA before setup.')
     p.add_argument('--steps', type=int, default=100)
     p.add_argument('--half_life', type=float, default=50.0)
     p.add_argument('--T_init', type=float, default=0.5)
@@ -255,9 +306,17 @@ def main() -> None:
         loss_cfg=loss_cfg,
         output_dir=args.output_dir,
         mutation_bias=args.mutation_bias,
+        random_init_len=args.random_init_len,
+        random_init_seed=args.seed,
     )
 
-    init_seq = args.init_seq or evaluator.initial_seq
+    if args.random_init_len is not None and args.random_init_len > 0:
+        if args.init_seq:
+            log.warning("random_init_len provided; overriding --init_seq with random initialization.")
+        init_seq = evaluator.initial_seq
+        log.info("Random initialization enabled: length=%d seed=%s", args.random_init_len, str(args.seed))
+    else:
+        init_seq = args.init_seq or evaluator.initial_seq
     log.info(
         "MCMC setup: steps=%d, half_life=%.3g, T_init=%.3g, mutation_rate=%d, seed=%s, init_len=%d",
         args.steps, args.half_life, args.T_init, args.mutation_rate, str(args.seed), len(init_seq)
