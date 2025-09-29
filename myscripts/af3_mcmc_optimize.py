@@ -31,6 +31,7 @@ import pathlib
 from dataclasses import dataclass
 import logging
 from typing import Dict, Optional, Sequence
+import csv
 
 
 # Allow importing sibling scripts under myscripts/
@@ -45,6 +46,8 @@ from peptide_variant_screen import (
 from afdesign_mcmc_skeleton import (
     run_mcmc_design,
     MCMCConfig,
+    propose_mutation as _propose_mutation,
+    seq_idx_to_str as _seq_idx_to_str,
 )
 from alphafold3.common import folding_input as _folding_input
 import dataclasses as _dc
@@ -285,6 +288,10 @@ def main() -> None:
     p.add_argument('--mutation_bias', type=str, choices=['uniform', 'peptide_plddt'], default='uniform',
                    help='If peptide_plddt, bias mutation probability proportional to (1 - per-residue peptide pLDDT)')
 
+    # Resume option
+    p.add_argument('--resume', action='store_true',
+                   help='Resume from existing CSVs in output_dir. Uses the last accepted sequence from mcmc_trace.csv as the starting point, continues step/eval numbering, and appends to existing CSVs.')
+
     args = p.parse_args()
 
     # Configure logging (align with existing logs)
@@ -325,6 +332,67 @@ def main() -> None:
         log.info("Random initialization enabled: length=%d seed=%s", args.random_init_len, str(args.seed))
     else:
         init_seq = args.init_seq or evaluator.initial_seq
+
+    # Prepare CSV paths before potential resume logic
+    summary_csv = args.output_dir / "mcmc_designs.csv"
+    trace_csv = args.output_dir / "mcmc_trace.csv"
+
+    # Resume support: determine init_seq, iteration offset, and step offset from existing CSVs
+    step_offset = 0
+    eval_offset = 0
+    prev_best_seq = None
+    if args.resume:
+        # Compute existing eval count from designs CSV
+        if summary_csv.exists():
+            try:
+                with open(summary_csv, 'r', newline='') as f:
+                    r = csv.reader(f)
+                    row_count = sum(1 for _ in r)
+                eval_offset = max(row_count - 1, 0)  # minus header
+            except Exception as e:
+                log.warning("Failed to read existing designs CSV for resume: %s", e)
+        # Determine step offset and restart seq from trace CSV if available
+        if trace_csv.exists():
+            try:
+                with open(trace_csv, 'r', newline='') as f:
+                    r = csv.reader(f)
+                    header = next(r, None)
+                    rows = list(r)
+                if rows:
+                    last = rows[-1]
+                    try:
+                        step_offset = int(last[0]) + 1
+                    except Exception:
+                        step_offset = 0
+                    # columns: ... current_seq_after (idx 11), best_seq (idx 12)
+                    last_current_after = last[11]
+                    prev_best_seq = last[12]
+                    # Choose last accepted current sequence if available; else fall back to last row's current_seq_after
+                    chosen = None
+                    for r in reversed(rows):
+                        try:
+                            if int(r[1]) == 1:
+                                chosen = r
+                                break
+                        except Exception:
+                            continue
+                    init_seq = (chosen[11] if chosen is not None else last_current_after) or init_seq
+            except Exception as e:
+                log.warning("Failed to read trace CSV for resume: %s", e)
+        else:
+            # No trace: use designs CSV for starting sequence selection
+            if summary_csv.exists():
+                try:
+                    with open(summary_csv, 'r', newline='') as f:
+                        dr = csv.DictReader(f)
+                        rows = list(dr)
+                    if rows:
+                        # Without trace we cannot know acceptance; best approximation is last sequence row
+                        init_seq = rows[-1].get('sequence') or init_seq
+                except Exception as e:
+                    log.warning("Failed to read designs CSV for resume fallback: %s", e)
+            else:
+                log.warning("--resume set but no CSVs found in %s; starting fresh.", args.output_dir)
     # Resolve fixed positions after determining initial sequence
     fixed_positions_0b = None
     if args.fixed_positions:
@@ -382,8 +450,6 @@ def main() -> None:
 
     # Adapter for MCMC skeleton
     # Prepare CSV summary file that will be updated on-the-fly
-    import csv
-    summary_csv = args.output_dir / "mcmc_designs.csv"
     if not summary_csv.exists():
         with open(summary_csv, 'w', newline='') as f:
             writer = csv.writer(f)
@@ -393,7 +459,17 @@ def main() -> None:
                 'loss', 'variant_dir'
             ])
 
-    eval_counter = {'n': 0}
+    # Set up per-step trace logging without modifying the per-sequence CSV
+    if not trace_csv.exists():
+        with open(trace_csv, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'step', 'accepted', 'T', 'current_loss', 'proposal_loss', 'delta',
+                'current_loss_after', 'best_loss', 'best_step',
+                'current_seq_before', 'proposal_seq', 'current_seq_after', 'best_seq'
+            ])
+
+    eval_counter = {'n': int(eval_offset)}
 
     def _write_outputs_for_sequence(seq: str, cache_entry: Dict) -> None:
         """Write AF3 outputs for this evaluated sequence and append CSV row.
@@ -463,6 +539,21 @@ def main() -> None:
         seed=args.seed,
     )
 
+    # Shared state for tracing sequences across propose/evaluate/progress
+    trace_state = {
+        'last_current_before': None,
+        'last_proposal': None,
+        'best_seq': prev_best_seq,
+        'init_seq': init_seq,
+    }
+
+    def propose_fn_with_trace(seq_idx, mutation_rate, pos_weights, rng):
+        # capture current sequence before proposing
+        trace_state['last_current_before'] = _seq_idx_to_str(seq_idx)
+        mut_idx = _propose_mutation(seq_idx, mutation_rate=mutation_rate, pos_weights=pos_weights, rng=rng)
+        trace_state['last_proposal'] = _seq_idx_to_str(mut_idx)
+        return mut_idx
+
     def progress_fn(info: Dict[str, float]):
         # info keys: step, T, current_loss, proposal_loss, delta, accepted,
         # accepted_total, accept_rate, best_loss, best_step, current_loss_after
@@ -479,14 +570,58 @@ def main() -> None:
             float(info.get('accept_rate', 0.0)),
         )
 
+        # Derive sequences for trace row
+        step = int(info.get('step', -1))
+        accepted = bool(info.get('accepted'))
+        current_before = trace_state['last_current_before'] if step > 0 else trace_state['init_seq']
+        proposal_seq = trace_state['last_proposal'] if step > 0 else trace_state['init_seq']
+        if accepted:
+            current_after = proposal_seq
+        else:
+            current_after = current_before
+
+        # Track best sequence string by comparing best_step
+        if trace_state['best_seq'] is None:
+            trace_state['best_seq'] = current_after
+        else:
+            # If this step established a new best, best_step should equal step
+            if int(info.get('best_step', -1)) == step and accepted:
+                trace_state['best_seq'] = proposal_seq
+            # else unchanged
+
+        # Append to trace CSV
+        try:
+            with open(trace_csv, 'a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    step,
+                    int(accepted),
+                    float(info.get('T', float('nan'))),
+                    float(info.get('current_loss', float('nan'))),
+                    float(info.get('proposal_loss', float('nan'))),
+                    float(info.get('delta', float('nan'))),
+                    float(info.get('current_loss_after', float('nan'))),
+                    float(info.get('best_loss', float('nan'))),
+                    int(info.get('best_step', -1)),
+                    current_before,
+                    proposal_seq,
+                    current_after,
+                    trace_state['best_seq'],
+                ])
+        except Exception as e:
+            log.warning("Failed to append MCMC trace row: %s", e)
+
     # Log every 1 step by default to interleave with AF3 logs
     result = run_mcmc_design(
         initial_seq=init_seq,
         evaluate_fn=evaluate_fn,
         config=cfg,
+        rng=None,
+        propose_fn=propose_fn_with_trace,
         progress_fn=progress_fn,
         log_every=1,
         fixed_positions=fixed_positions_0b,
+        step_offset=int(step_offset),
     )
 
     # Ensure best sequence is evaluated and write AF3 outputs

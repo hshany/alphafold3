@@ -179,6 +179,7 @@ def run_mcmc_design(
     progress_fn: Optional[Callable[[Dict[str, float]], None]] = None,
     log_every: int = 0,
     fixed_positions: Optional[Sequence[int]] = None,
+    step_offset: int = 0,
 ) -> MCMCResult:
     """
     Run MCMC with simulated annealing on sequences.
@@ -216,7 +217,8 @@ def run_mcmc_design(
 
     accepts = 0
     for step in range(config.steps):
-        T = default_temperature(step, config.T_init, config.half_life)
+        abs_step = int(step_offset) + step
+        T = default_temperature(abs_step, config.T_init, config.half_life)
 
         # Prepare mutation position weights from confidence (optional) and fixed mask
         pos_w = default_position_weights(
@@ -224,7 +226,7 @@ def run_mcmc_design(
         )
 
         # Propose mutation(s)
-        if step == 0:
+        if abs_step == 0:
             mut_seq_idx = list(current_seq_idx)
         else:
             mut_seq_idx = propose_fn(
@@ -240,11 +242,11 @@ def run_mcmc_design(
 
         # Metropolis acceptance
         delta = mut_loss - current_loss
-        accept = (step == 0) or (delta < 0.0) or (rng.random() < math.exp(-delta / max(1e-12, T)))
+        accept = (abs_step == 0) or (delta < 0.0) or (rng.random() < math.exp(-delta / max(1e-12, T)))
 
         # Log proposal before potentially updating state
         step_info = {
-            "step": step,
+            "step": abs_step,
             "T": T,
             "current_loss": current_loss,
             "proposal_loss": mut_loss,
@@ -264,7 +266,7 @@ def run_mcmc_design(
             if current_loss < best_loss:
                 best_loss = current_loss
                 best_seq = current_seq
-                best_step = step
+                best_step = abs_step
 
         # Emit progress
         if progress_fn is not None and (log_every and ((step + 1) % log_every == 0) or (step == config.steps - 1)):
