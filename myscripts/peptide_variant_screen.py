@@ -479,6 +479,8 @@ def write_variant_outputs(
     variant_dir: pathlib.Path,
     job_name: str,
     seed: int,
+    write_individual_samples: bool = True,
+    tgz_confidences: bool = False,
 ) -> Dict:
     """Write processed outputs for a variant, mirroring run_alphafold.write_outputs.
 
@@ -495,14 +497,35 @@ def write_variant_outputs(
     max_ranking_score = None
     max_ranking_result = None
 
+    def _tgz_conf_json(out_dir: pathlib.Path, base_name: str) -> None:
+        """Create a .tgz archive of the confidences JSON and remove the JSON."""
+        try:
+            import tarfile
+            json_path = out_dir / f"{base_name}_confidences.json"
+            if not json_path.exists():
+                return
+            tgz_path = out_dir / f"{base_name}_confidences.json.tgz"
+            with tarfile.open(tgz_path, mode="w:gz") as tf:
+                tf.add(json_path, arcname=f"{base_name}_confidences.json")
+            try:
+                os.remove(json_path)
+            except OSError as e:
+                logger.warning(f"Failed to remove original confidences.json: {e}")
+        except Exception as e:
+            logger.warning(f"Failed to tgz confidences JSON: {e}")
+
     for sample_idx, result in enumerate(inference_results):
-        sample_dir = variant_dir / f'seed-{seed}_sample-{sample_idx}'
-        sample_dir.mkdir(parents=True, exist_ok=True)
-        post_processing.write_output(
-            inference_result=result,
-            output_dir=sample_dir.as_posix(),
-            name=f'{job_name}_seed-{seed}_sample-{sample_idx}',
-        )
+        if write_individual_samples:
+            sample_dir = variant_dir / f'seed-{seed}_sample-{sample_idx}'
+            sample_dir.mkdir(parents=True, exist_ok=True)
+            sample_name = f'{job_name}_seed-{seed}_sample-{sample_idx}'
+            post_processing.write_output(
+                inference_result=result,
+                output_dir=sample_dir.as_posix(),
+                name=sample_name,
+            )
+            if tgz_confidences:
+                _tgz_conf_json(sample_dir, sample_name)
         rs = float(result.metadata['ranking_score'])
         ranking_scores.append((seed, sample_idx, rs))
         if max_ranking_score is None or rs > max_ranking_score:
@@ -517,6 +540,8 @@ def write_variant_outputs(
             terms_of_use=output_terms,
             name=job_name,
         )
+        if tgz_confidences:
+            _tgz_conf_json(variant_dir, job_name)
         import csv
         with open(variant_dir / f'{job_name}_ranking_scores.csv', 'w', newline='') as f:
             writer = csv.writer(f)

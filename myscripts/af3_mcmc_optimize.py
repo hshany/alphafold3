@@ -414,6 +414,8 @@ def main() -> None:
                 variant_dir=variant_dir,
                 job_name=job_name,
                 seed=int(cache_entry.get('seed', 0) or 0),
+                write_individual_samples=False,
+                tgz_confidences=True,
             )
         except Exception as e:
             log.warning(f"Failed to write outputs for eval {idx}: {e}")
@@ -500,6 +502,8 @@ def main() -> None:
         variant_dir=variant_dir,
         job_name=job_name,
         seed=int(best_eval.get('seed', 0) or 0),
+        write_individual_samples=False,
+        tgz_confidences=True,
     )
 
     # Save a small text summary
