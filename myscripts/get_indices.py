@@ -12,7 +12,7 @@ This script:
 import json
 import numpy as np
 from Bio import pairwise2
-from Bio.PDB import MMCIFParser
+from Bio.PDB import PDBParser, MMCIFParser
 from Bio.PDB.Polypeptide import is_aa
 from Bio.SeqUtils import seq1
 
@@ -28,7 +28,12 @@ def extract_sequence_from_cif(cif_file, chain_id='A'):
         str: Amino acid sequence in one-letter code
     """
     # Parse the CIF file
-    parser = MMCIFParser()
+    if cif_file.endswith('.cif'):
+        parser = MMCIFParser()
+    elif cif_file.endswith('.pdb'):
+        parser = PDBParser()
+    else:
+        raise(f'Unsupported file type: {cif_file}')
     structure = parser.get_structure('template', cif_file)
     
     # Extract the sequence for the specified chain
