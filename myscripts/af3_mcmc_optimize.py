@@ -37,7 +37,7 @@ import csv
 # Allow importing sibling scripts under myscripts/
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from peptide_variant_screen import (
+from peptide_variant_screen_1seed import (
     OptimizedPeptideRunner,
     load_fold_input,
     write_variant_outputs,
