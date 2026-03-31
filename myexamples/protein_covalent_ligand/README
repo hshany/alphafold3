@@ -1,0 +1,3 @@
+python ${af3_dir}/myscripts/mol2ccd.py  --comp-id C170 --name c170 -o c170.cif --embed c170.mol 
+colabfold_batch sting.fasta msa --msa-only
+sbatch ${af3_dir}/myscripts/run_af3.sbatch

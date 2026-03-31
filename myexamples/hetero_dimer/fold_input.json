@@ -1,0 +1,20 @@
+{
+  "name": "Bcl2_BAD",
+  "sequences": [
+    {
+      "protein": {
+        "id": ["A"],
+        "sequence": "MAHAGRTGYDNREIVMKYIHYKLSQRGYEWDAGDVGAAPPGAAPAPGIFSSQPGHTPHPAASRDPVARTSPLQTPAAPGAAAGPALSPVPPVVHLTLRQAGDDFSRRYRRDFAEMSSQLHLTPFTARGRFATVVEELFRDGVNWGRIVAFFEFGGVMCVESVNREMSPLVDNIALWMTEYLNRHLHTWIQDNGGWDAFVELYGPSMRPLFDFSWLSLKTLLSLALVGACITLGAYLGHK"
+      }
+    },
+    {
+      "protein": {
+        "id": ["B"],
+        "sequence": "GSGQRYGRELRRMSDEFVDGSG"
+      }
+    }
+  ],
+  "modelSeeds": [1],
+  "dialect": "alphafold3",
+  "version": 1
+}

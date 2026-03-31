@@ -1,0 +1,18 @@
+# Set af3 dir
+af3_dir=/home/hehuang/Tools/alphafold3
+
+# Build MSA
+source /home/hehuang/miniconda3/condaenv.sh
+conda activate colabfold
+colabfold_batch tl1a_trim.fasta msa --msa-only
+
+# Build custom CCD
+conda deactivate
+conda activate py39
+python ${af3_dir}/myscripts/mol2ccd.py  --comp-id LINK --name linker1 -o linker1.cif linker1.mol
+
+# Create fold_input.json
+
+
+# Submit job
+sbatch ${af3_dir}/myscripts/run_af3.sbatch

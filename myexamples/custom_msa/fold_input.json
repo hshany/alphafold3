@@ -1,0 +1,32 @@
+{
+  "name": "peptide5-4",
+  "sequences": [
+    {
+      "protein": {
+        "id": "A",
+        "sequence": "PGQTHLETTFTGDGTPKTIRVTQ",
+        "modifications": [
+            {
+                "ptmType": "DPR",
+                "ptmPosition": 1
+            }
+        ],
+        "templates": [],
+        "pairedMsa": "",
+        "unpairedMsa": ""
+      }
+    },
+    {
+      "protein": {
+        "id": "B",
+        "sequence": "EKVMEIKLIKGPKGLGFSIAGGVGNQHIPGDNSIYVTKIIEGGAAHKDGRLQIGDKILAVNSVGLEDVMHEDAVAALKNTYDVVYLKVAKPSNAETMA",
+        "templates": [],
+        "pairedMsa": "",
+        "unpairedMsaPath": "msa/pdz2.a3m"
+      }
+    }
+  ],
+  "modelSeeds": [1],
+  "dialect": "alphafold3",
+  "version": 1
+}

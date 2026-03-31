@@ -1,0 +1,37 @@
+{
+  "name": "monomer",
+  "sequences": [
+    {
+      "protein": {
+        "id": ["A"],
+        "sequence": "DGDKPRAHLTVVRQTPTQHFKNQFPALHWEHELGLAFTKNRMNYTNKFLLIPESGDYFIYSQVTFRGMTSECSEIRQAGRPNKPDSITVVITKVTDSYPEPTQLLMGTKSVCEVGSNWFQPIYLGAMFSLQEGDKLMVNVSDISLVDYTKEDKTFFGAFLL",
+        "templates": [],
+        "pairedMsa": "",
+        "unpairedMsaPath": "msa/tl1a_trim.a3m"
+      }
+    },
+    {
+      "protein": {
+        "id": ["P"],
+        "sequence": "CWFYRDRVWYIEWCG",
+        "templates": [],
+        "pairedMsa": "",
+        "unpairedMsa": ""
+      }
+    },
+    {
+      "ligand": {
+        "id": ["L"],
+        "ccdCodes": ["LINK"]
+      }
+    }
+  ],
+  "bondedAtomPairs": [
+    [["P", 1, "SG"], ["L", 1, "C3"]],
+    [["P", 14, "SG"], ["L", 1, "C6"]]
+  ],
+  "userCCDPath": "linker1.cif",
+  "modelSeeds": [1, 2, 3, 4, 5],
+  "dialect": "alphafold3",
+  "version": 1
+}

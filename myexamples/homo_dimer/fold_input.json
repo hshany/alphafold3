@@ -1,0 +1,14 @@
+{
+  "name": "S100A4",
+  "sequences": [
+    {
+      "protein": {
+        "id": ["A","B"],
+        "sequence": "MACPLEKALDVMVSTFHKYSGKEGDKFKLNKSELKELLTRELPSFLGKRTDEAAFQKLMSNLDSNRDNEVDFQEYCVFLSCIAMMCNEFFEGFPDKQPRKK"
+      }
+    }
+  ],
+  "modelSeeds": [1],
+  "dialect": "alphafold3",
+  "version": 1
+}

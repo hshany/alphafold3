@@ -1,0 +1,27 @@
+{
+  "name": "sting",
+  "sequences": [
+    {
+      "protein": {
+        "id": ["A", "B"],
+        "sequence": "MPHSSLHPSIPCPRGHGAQKAALVLLSACLVTLWGLGEPPEHTLRYLVLHLASLQLGLLLNGVCSLAEELRHIHSRYRGSYWRTVRACLGCPLRRGALLLLSIYFYYSLPNAVGPPFTWMLALLGLSQALNILLGLKGLAPAEISAVCEKGNFNVAHGLAWSYYIGYLRLILPELQARIRTYNQHYNNLLRGAVSQRLYILLPLDCGVPDNLSMADPNIRFLDKLPQQTGDHAGIKDRVYSNSIYELLENGQRAGTCVLEYATPLQTLFAMSQYSQAGFSREDRLEQAKLFCRTLEDILADAPESQNNCRLIAYQEPADDSSFSLSQEVLRHLRQEEKEEVTVGSLKTSAVPSTSTMSQEPELLISGMEKPLPLRTDFS",
+        "templates": [],
+        "pairedMsa": "",
+        "unpairedMsaPath": "msa/sting.a3m"
+      }
+    },
+    {
+      "ligand": {
+        "id": ["L"],
+        "ccdCodes": ["C170"]
+      }
+    }
+  ],
+  "bondedAtomPairs": [
+    [["A", 91, "SG"], ["L", 1, "C5"]]
+  ],
+  "userCCDPath": "c170.cif",
+  "modelSeeds": [1, 2, 3, 4, 5],
+  "dialect": "alphafold3",
+  "version": 1
+}

@@ -1,0 +1,6 @@
+Get the .a3m file from a previous AF3 run or from mmseq2 server by running the following commands:
+
+source /home/hehuang/miniconda3/condaenv.sh
+conda activate colabfold
+
+colabfold_batch pdz2.fasta msa --msa-only
