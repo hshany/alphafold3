@@ -1,5 +1,7 @@
 __pycache__/
 *.py[cod]
+*.err
+*.out
 
 src/alphafold3/constants/converters/*.pickle
 
