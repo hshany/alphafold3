@@ -37,7 +37,7 @@ import csv
 # Allow importing sibling scripts under myscripts/
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from peptide_variant_screen_1seed import (
+from peptide_variant_screen import (
     OptimizedPeptideRunner,
     load_fold_input,
     write_variant_outputs,
@@ -52,6 +52,8 @@ from afdesign_mcmc_skeleton import (
 from alphafold3.common import folding_input as _folding_input
 import dataclasses as _dc
 import random as _random
+
+_LOG = logging.getLogger("mcmc.best_seed")
 
 
 @dataclass
@@ -161,15 +163,50 @@ class AF3MCMCEvaluator:
 
         # Run AF3 inference via optimized runner
         run_out = self.runner.run_peptide_variant(peptide_sequence, self.peptide_chain_id)
-        inf_results = run_out['inference_results']
+        seed_results = run_out.get('seed_results')
 
-        # Compute metrics on best-ranked sample
-        metrics = _compute_best_sample_metrics(
-            inf_results,
-            peptide_chain_id=self.peptide_chain_id,
-            receptor_chain_id=self.receptor_chain_id,
-        )
-        loss = self._compute_loss(metrics)
+        if seed_results:
+            best_entry = None
+            best_metrics = None
+            best_loss = None
+            for entry in seed_results:
+                inf_results = entry.get('inference_results') or []
+                if not inf_results:
+                    continue
+                metrics = _compute_best_sample_metrics(
+                    inf_results,
+                    peptide_chain_id=self.peptide_chain_id,
+                    receptor_chain_id=self.receptor_chain_id,
+                )
+                loss = self._compute_loss(metrics)
+                _LOG.info(
+                    "Seed %s metrics: ranking=%.4f pLDDT=%.2f ipTM=%.4f PAE=%.2f loss=%.4f",
+                    str(entry.get('seed')),
+                    float(metrics.get('ranking_score', float('nan'))),
+                    float(metrics.get('plddt', float('nan'))),
+                    float(metrics.get('iptm', float('nan'))),
+                    float(metrics.get('pae', float('nan'))),
+                    float(loss),
+                )
+                if best_entry is None or loss < best_loss:
+                    best_entry = entry
+                    best_metrics = metrics
+                    best_loss = loss
+            if best_entry is None:
+                raise ValueError("All seed evaluations returned empty inference results.")
+            inf_results = best_entry['inference_results']
+            metrics = best_metrics
+            loss = best_loss if best_loss is not None else float('inf')
+            chosen_seed = best_entry.get('seed')
+        else:
+            inf_results = run_out['inference_results']
+            metrics = _compute_best_sample_metrics(
+                inf_results,
+                peptide_chain_id=self.peptide_chain_id,
+                receptor_chain_id=self.receptor_chain_id,
+            )
+            loss = self._compute_loss(metrics)
+            chosen_seed = run_out.get('seed')
 
         # Optional per-position mutation bias from peptide residue pLDDT
         pos_conf: Optional[Sequence[float]] = None
@@ -216,7 +253,7 @@ class AF3MCMCEvaluator:
             'metrics': metrics,
             'pos_confidence': pos_conf,  # used if mutation_bias == 'peptide_plddt'
             'inference_results': inf_results,
-            'seed': run_out.get('seed'),
+            'seed': chosen_seed,
         }
         self._cache[peptide_sequence] = out
         return out
