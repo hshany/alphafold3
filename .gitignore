@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+
+src/alphafold3/constants/converters/*.pickle
+
+modified_files/
